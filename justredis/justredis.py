@@ -3,6 +3,7 @@ import socket
 from threading import Lock
 from collections import deque
 from hashlib import sha1
+from select import select
 
 import hiredis
 
@@ -218,7 +219,7 @@ class Connection(object):
         connectionhandler = config.get('connectionhandler', cls)
         return connectionhandler(endpoint, config)
 
-    def __init__(self, endpoint, config, socket_class=socket, lock_class=Lock):
+    def __init__(self, endpoint, config, socket_class=socket, lock_class=Lock, select=select):
         connecttimeout = config.get('connecttimeout', socket.getdefaulttimeout())
         connectretry = config.get('connectretry', 0) + 1
         sockettimeout = config.get('sockettimeout', socket.getdefaulttimeout())
@@ -260,6 +261,7 @@ class Connection(object):
         self.parser = hiredis_parser()
         self.parser.send(None)
         self.lastdatabase = 0
+        self.select = select
         password = config.get('password')
         if password is not None:
             cmd = Command((b'AUTH', password))
@@ -306,8 +308,9 @@ class Connection(object):
                 for x in cmd.stream(self.chunk_send_size):
                     self.socket.sendall(x)
                 cmd.set_resolver(self)
-                # TODO (pubsub) dont append if pubsub cmd._enqueue (not implemented yet)
-                self.commands.append(cmd)
+                # This is for pub/sub to not expect a result
+                if cmd._enqueue:
+                    self.commands.append(cmd)
         except Exception as e:
             self.close_write()
             cmd.set_result(e)
@@ -344,20 +347,28 @@ class Connection(object):
             self.close()
             raise
 
+    def wait(self, timeout):
+        # TODO I/O errors will show up on read as well, yes ?
+        res = self.select([self.socket], [], [], timeout)
+        if not res[0]:
+            return False
+        return True
+
 
 class Command(object):
-    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries'
+    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue'
 
-    def __init__(self, data, database=None, encoder=None, decoder=None, throw=True, retries=3):
+    def __init__(self, data, database=None, encoder=None, decoder=None, throw=True, retries=3, enqueue=True):
         self._data = data
         self._database = database
-        self._resolver = None
         self._encoder = encoder or utf8_encode
         self._decoder = decoder
         self._throw = throw
+        self._retries = retries
+        self._enqueue = enqueue
+        self._resolver = None
         self._got_result = False
         self._result = None
-        self._retries = retries
 
     def get_number(self):
         return self._database._number if self._database else None
@@ -373,7 +384,8 @@ class Command(object):
         return encode_command(self._data, self._encoder)
 
     def set_resolver(self, connection):
-        self._resolver = connection
+        if self._enqueue:
+            self._resolver = connection
 
     def set_result(self, result, dont_retry=False):
         try:
@@ -443,9 +455,9 @@ class Multiplexer(object):
         return Database(self, number, encoder, decoder, retries)
 
     def pubsub(self):
-        if self._pubsub:
-            return self._pubsub
-        return PubSub(self)
+        if self._pubsub is None:
+            self._pubsub = PubSub(self)
+        return self._pubsub
 
     def _send_command(self, cmd):
         if self._connection is None or self._connection.closed:
@@ -474,14 +486,16 @@ class Database(object):
         return MultiCommand(self, retries if retries is not None else self._retries)
 
 
+# To know the result of a multi command simply resolve any command inside
 class MultiCommand(object):
-    __slots__ = '_database', '_cmds', '_done', '_retries'
+    __slots__ = '_database', '_cmds', '_done', '_retries', '_enqueue'
 
     def __init__(self, database, retries):
         self._database = database
         self._cmds = []
         self._done = False
         self._retries = retries
+        self._enqueue = True
 
     def stream(self, chunk_size):
         return chunk_encoded_commands(self._cmds, chunk_size)
@@ -563,29 +577,77 @@ class MultiCommand(object):
         return cmd
 
 
+# TODO how to handle retries on I/O errors ?
+# TODO the multiplexer .close should close this as well
+# TODO encoding?
+# This is a global instance per multiplexer
 class PubSub(object):
-    def __init__(self, multiplexer):
+    __slots__ = '_multiplexer', '_channels', '_patterns', '_connection', '_lock'
+
+    def __init__(self, multiplexer, lock_class=Lock):
         self._multiplexer = multiplexer
-        self._channels = []
-        self._patterns = []
+        self._channels = set()
+        self._patterns = set()
+        self._connection = None
+        self._lock = lock_class()
+
+    def create_connection(self):
+        if self._connection is None or self._connection.closed:
+            with self._lock:
+                if self._connection is None or self._connection.closed:
+                    self._connection = Connection.create(self._multiplexer._endpoints[0], self._multiplexer._configuration)
+                    return True
+        return False
+
+    def _command(self, cmd, *args):
+        if self.create_connection():
+            if self._channels:
+                cmd = Command((b'SUBSCRIBE', ) + tuple(self._channels), enqueue=False, retries=0)
+                self._connection.send(cmd)
+            if self._patterns:
+                cmd = Command((b'PSUBSCRIBE', ) + tuple(self._patterns), enqueue=False, retries=0)
+                self._connection.send(cmd)
+        # If it's a new connection, it will already run the command in the given list above
+        else:
+            cmd = Command((cmd, ) + args, enqueue=False, retries=0)
+            self._connection.send(cmd)
+        if not self._channels and not self._patterns:
+            self._connection.close()
 
     def subscribe(self, *channels):
-        pass
-    
+        self._channels.update(channels)
+        self._command(b'SUBSCRIBE', *channels)
+
     def unsubscribe(self, *channels):
-        pass
+        if not channels:
+            self._channels = set()
+        else:
+            self._channels -= set(channels)
+        self._command(b'UNSUBSCRIBE', *channels)
     
     def psubscribe(self, *patterns):
-        pass
+        self._patterns.update(_patterns)
+        self._command(b'PSUBSCRIBE', *_patterns)
     
     def punsubscribe(self, *patterns):
-        pass
+        if not patterns:
+            self._patterns = set()
+        else:
+            self._patterns -= set(_patterns)
+        self._command(b'PUNSUBSCRIBE', *_patterns)
     
-    def ping(self, msg):
-        pass
-
-    def close(self):
-        pass
+    def ping(self, msg=None):
+        if msg:
+            self._command(b'PING', msg)
+        else:
+            self._command(b'PING')
 
     def message(self, timeout=None):
-        pass
+        res = self._connection.recv(allow_empty=True)
+        if res is False:
+            if self._connection.wait(timeout):
+                return self._connection.recv()
+            else:
+                return None
+        else:
+            return res
