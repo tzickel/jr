@@ -1,11 +1,14 @@
+from __future__ import absolute_import
 import sys
-import socket
-from threading import Lock
 from collections import deque
 from hashlib import sha1
-from select import select
+import warnings
 
 import hiredis
+
+from .environment import get_env
+
+Lock, socket, select = get_env("Lock", "socket", "select")
 
 # Exceptions
 # An error response from the redis server
@@ -219,7 +222,7 @@ class Connection(object):
         connectionhandler = config.get('connectionhandler', cls)
         return connectionhandler(endpoint, config)
 
-    def __init__(self, endpoint, config, socket_class=socket, lock_class=Lock, select=select):
+    def __init__(self, endpoint, config):
         connecttimeout = config.get('connecttimeout', socket.getdefaulttimeout())
         connectretry = config.get('connectretry', 0) + 1
         sockettimeout = config.get('sockettimeout', socket.getdefaulttimeout())
@@ -228,13 +231,13 @@ class Connection(object):
         while connectretry:
             try:
                 if isinstance(endpoint, str):
-                    sock = socket_class.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     sock.settimeout(connecttimeout)
                     sock.connect(endpoint)
                     sock.settimeout(sockettimeout)
                     self.socket = sock
                 elif isinstance(endpoint, tuple):
-                    self.socket = socket_class.create_connection(endpoint, timeout=connecttimeout)
+                    self.socket = socket.create_connection(endpoint, timeout=connecttimeout)
                     self.socket.settimeout(sockettimeout)
                 else:
                     raise RedisError('Invalid endpoint')
@@ -252,10 +255,12 @@ class Connection(object):
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, tcpkeepalive)
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, tcpkeepalive // 3)
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            else:
+                warnings.warn("TCP keepalive supports on linux for now")
         self.commands = deque()
         self.closed = False
-        self.read_lock = lock_class()
-        self.send_lock = lock_class()
+        self.read_lock = Lock()
+        self.send_lock = Lock()
         self.chunk_send_size = 6000
         self.buffer = bytearray(buffersize)
         self.parser = hiredis_parser()
@@ -285,7 +290,7 @@ class Connection(object):
         finally:
             self.socket = None
             if self.commands:
-                # TODO (thread) threading issue here, we need to check in other places if self.closed and throw exception (check in locks which use this)
+                # Hmmm... I think there is no threading issue here with regards to other uses of read/send locks in the code ?
                 with self.read_lock:
                     with self.send_lock:
                         for command in self.commands:
@@ -293,7 +298,7 @@ class Connection(object):
                             command.set_result(RedisError('Connection closed'), dont_retry=True)
                         self.commands = []
 
-    # TODO (performance) we can actually try to coalese multiple sends here, but let's give the tcp stack an option to do this (because of DELAY)
+    # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
     def send(self, cmd):
         try:
             with self.send_lock:
@@ -348,7 +353,7 @@ class Connection(object):
             raise
 
     def wait(self, timeout):
-        # TODO I/O errors will show up on read as well, yes ?
+        # I am hoping here that select on all platforms returns a read error on closing
         res = self.select([self.socket], [], [], timeout)
         if not res[0]:
             return False
@@ -429,10 +434,8 @@ class Command(object):
         return self._result
 
 
-# TODO add pubsub !!!
-# TODO thread safety !!!
 class Multiplexer(object):
-    __slots__ = '_endpoints', '_configuration', '_connection', '_scripts', '_scripts_sha', '_pubsub'
+    __slots__ = '_endpoints', '_configuration', '_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock'
 
     def __init__(self, configuration=None):
         self._endpoints, self._configuration = parse_uri(configuration)
@@ -441,11 +444,16 @@ class Multiplexer(object):
         self._scripts = {}
         self._scripts_sha = {}
         self._pubsub = None
+        self._lock = Lock()
 
     def close(self):
         if self._connection:
-            self._connection.close()
-            self._connection = None
+            with self._lock:
+                try:
+                    self._connection.close()
+                except Exception:
+                    pass
+                self._connection = None
 
     # TODO (misc) is this sane or we should not support this (explicitly call close?)
     def __del__(self):
@@ -456,12 +464,16 @@ class Multiplexer(object):
 
     def pubsub(self):
         if self._pubsub is None:
-            self._pubsub = PubSub(self)
+            with self._lock:
+                if self._pubsub is None:
+                    self._pubsub = PubSub(self)
         return self._pubsub
 
     def _send_command(self, cmd):
         if self._connection is None or self._connection.closed:
-            self._connection = Connection.create(self._endpoints[0], self._configuration)
+            with self._lock:
+                if self._connection is None or self._connection.closed:
+                    self._connection = Connection.create(self._endpoints[0], self._configuration)
         self._connection.send(cmd)
 
 
@@ -580,16 +592,17 @@ class MultiCommand(object):
 # TODO how to handle retries on I/O errors ?
 # TODO the multiplexer .close should close this as well
 # TODO encoding?
+# TODO should I have a registration object ? (per object lifetime)
 # This is a global instance per multiplexer
 class PubSub(object):
     __slots__ = '_multiplexer', '_channels', '_patterns', '_connection', '_lock'
 
-    def __init__(self, multiplexer, lock_class=Lock):
+    def __init__(self, multiplexer):
         self._multiplexer = multiplexer
         self._channels = set()
         self._patterns = set()
         self._connection = None
-        self._lock = lock_class()
+        self._lock = Lock()
 
     def create_connection(self):
         if self._connection is None or self._connection.closed:
