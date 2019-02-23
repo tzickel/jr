@@ -3,12 +3,10 @@ import sys
 from collections import deque
 from hashlib import sha1
 import warnings
+from asyncio import open_connection, Lock
+import socket
 
 import hiredis
-
-from .environment import get_env
-
-Lock, socket, select = get_env("Lock", "socket", "select")
 
 # Exceptions
 # An error response from the redis server
@@ -154,7 +152,7 @@ def hiredis_parser():
             res = RedisReplyError(*res.args)
         data = yield res
         if data:
-            reader.feed(*data)
+            reader.feed(data)
 
 
 # TODO better handling for unix domain, and default ports in tuple / list
@@ -218,11 +216,13 @@ def parse_command(source, *args, **kwargs):
 
 class Connection(object):
     @classmethod
-    def create(cls, endpoint, config):
+    async def create(cls, endpoint, config):
         connectionhandler = config.get('connectionhandler', cls)
-        return connectionhandler(endpoint, config)
+        connection = connectionhandler()
+        await connection._init(endpoint, config)
+        return connection
 
-    def __init__(self, endpoint, config):
+    async def _init(self, endpoint, config):
         connecttimeout = config.get('connecttimeout', socket.getdefaulttimeout())
         connectretry = config.get('connectretry', 0) + 1
         sockettimeout = config.get('sockettimeout', socket.getdefaulttimeout())
@@ -237,8 +237,10 @@ class Connection(object):
                     sock.settimeout(sockettimeout)
                     self.socket = sock
                 elif isinstance(endpoint, tuple):
-                    self.socket = socket.create_connection(endpoint, timeout=connecttimeout)
-                    self.socket.settimeout(sockettimeout)
+#                    self.socket = socket.create_connection(endpoint, timeout=connecttimeout)
+#                    self.reader, self.writer = await open_connection(host=endpoint[0], port=endpoint[1], timeout=connecttimeout, limit=buffersize)
+                    self.reader, self.writer = await open_connection(host=endpoint[0], port=endpoint[1], limit=buffersize)
+#                    self.socket.settimeout(sockettimeout)
                 else:
                     raise RedisError('Invalid endpoint')
                 break
@@ -247,8 +249,9 @@ class Connection(object):
                 if not connectretry:
                     raise RedisError('Connection failed: %r' % e)
         # needed for cluster support
-        self.name = self.socket.getpeername()
-        if tcpkeepalive:
+        self.name = self.writer.get_extra_info('peername')
+        #TODO
+        if False:#tcpkeepalive:
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             # TODO support other platforms (atleast windows)
             if platform == 'linux':
@@ -262,11 +265,13 @@ class Connection(object):
         self.read_lock = Lock()
         self.send_lock = Lock()
         self.chunk_send_size = 6000
-        self.buffer = bytearray(buffersize)
+#        self.buffer = bytearray(buffersize)
+        self.buffersize = buffersize
         self.parser = hiredis_parser()
         self.parser.send(None)
         self.lastdatabase = 0
-        self.select = select
+        # TODO REPLACE
+        #self.select = select
         password = config.get('password')
         if password is not None:
             cmd = Command((b'AUTH', password))
@@ -281,7 +286,7 @@ class Connection(object):
     def close_write(self):
         self.closed = True
 
-    def close(self):
+    async def close(self):
         self.closed = True
         try:
             self.socket.close()
@@ -291,73 +296,71 @@ class Connection(object):
             self.socket = None
             if self.commands:
                 # Hmmm... I think there is no threading issue here with regards to other uses of read/send locks in the code ?
-                with self.read_lock:
-                    with self.send_lock:
+                async with self.read_lock:
+                    async with self.send_lock:
                         for command in self.commands:
                             # This are already sent and we don't know if they happened or not.
-                            command.set_result(RedisError('Connection closed'), dont_retry=True)
+                            await command.set_result(RedisError('Connection closed'), dont_retry=True)
                         self.commands = []
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
-    def send(self, cmd):
+    async def send(self, cmd):
         try:
-            with self.send_lock:
+            async with self.send_lock:
                 db_number = cmd.get_number()
                 if db_number is not None and db_number != self.lastdatabase:
                     select_cmd = Command((b'SELECT', db_number))
                     for x in select_cmd.stream(self.chunk_send_size):
-                        self.socket.sendall(x)
+                        self.writer.write(x)
+                        # TODO should I drain ?
                     self.commands.append(select_cmd)
                     self.lastdatabase = db_number
                 # We send before we append to commands list because another thread might do resolve, and this will race
                 for x in cmd.stream(self.chunk_send_size):
-                    self.socket.sendall(x)
+                    self.writer.write(x)
+                    await self.writer.drain()
                 cmd.set_resolver(self)
                 # This is for pub/sub to not expect a result
                 if cmd._enqueue:
                     self.commands.append(cmd)
         except Exception as e:
             self.close_write()
-            cmd.set_result(e)
+            await cmd.set_result(e)
 
-    def resolve(self):
+    async def resolve(self):
         try:
-            with self.read_lock:
+            async with self.read_lock:
                 cmd = self.commands.popleft()
                 num_results = cmd.how_many_results()
-                results = [self.recv() for _ in range(num_results)]
-            cmd.set_result(results)
+                results = [await self.recv() for _ in range(num_results)]
+            await cmd.set_result(results)
             return True
         except IndexError:
             pass
         except Exception as e:
-            self.close()
+            await self.close()
             # We should not retry if it/s I/O error (handle it inside)
-            cmd.set_result(e)
+            await cmd.set_result(e)
             # We don't raise here, because it makes no sense ?
         return False
 
-    def recv(self, allow_empty=False):
+    async def recv(self, allow_empty=False):
         try:
             res = self.parser.send(None)
             while res is False:
                 if allow_empty:
                     return res
-                length = self.socket.recv_into(self.buffer)
-                if length == 0:
+                # TODO replace
+                buffer = await self.reader.read(self.buffersize)
+#                length = self.socket.recv_into(self.buffer)
+                #if length == 0:
+                if not buffer:
                     raise RedisError('Connection closed')
-                res = self.parser.send((self.buffer, 0, length))
+                res = self.parser.send(buffer)
             return res
         except Exception:
-            self.close()
+            await self.close()
             raise
-
-    def wait(self, timeout):
-        # I am hoping here that select on all platforms returns a read error on closing
-        res = self.select([self.socket], [], [], timeout)
-        if not res[0]:
-            return False
-        return True
 
 
 class Command(object):
@@ -392,14 +395,14 @@ class Command(object):
         if self._enqueue:
             self._resolver = connection
 
-    def set_result(self, result, dont_retry=False):
+    async def set_result(self, result, dont_retry=False):
         try:
             if not isinstance(result, Exception):
                 result = result[0]
             if self._database and not dont_retry and self._retries and isinstance(result, command_retry_errors):
                 self._retries -= 1
                 if not isinstance(result, RedisReplyError):
-                    self._database._multiplexer._send_command(self)
+                    await self._database._multiplexer._send_command(self)
                     return
                 else:
                     # hiredis exceptions are already encoded....
@@ -408,7 +411,7 @@ class Command(object):
                         script = self._database._scripts_sha.get(sha)
                         if script:
                             self._data = (b'EVAL', script) + self._data[2:]
-                            self._database._multiplexer._send_command(self)
+                            await self._database._multiplexer._send_command(self)
                             return
             # TODO (encoding) should we call decoder on Exceptions as well ?
             self._result = result if not self._decoder else self._decoder(result)
@@ -423,18 +426,18 @@ class Command(object):
             self._database = None
             self._resolver = None
 
-    def __call__(self):
+    async def __call__(self):
         if not self._got_result and not self._resolver:
             raise RedisError('Command is not finalized yet')
         # This is a loop because of multi threading.
         while not self._got_result:
-            self._resolver.resolve()
+            await self._resolver.resolve()
         if self._throw and isinstance(self._result, Exception):
             raise self._result
         return self._result
 
 
-class Multiplexer(object):
+class MultiplexerAsync(object):
     __slots__ = '_endpoints', '_configuration', '_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock'
 
     def __init__(self, configuration=None):
@@ -446,35 +449,28 @@ class Multiplexer(object):
         self._pubsub = None
         self._lock = Lock()
 
-    def close(self):
+    async def close(self):
         if self._connection:
-            with self._lock:
+            async with self._lock:
                 try:
-                    self._connection.close()
+                    await self._connection.close()
                 except Exception:
                     pass
                 self._connection = None
 
     # TODO (misc) is this sane or we should not support this (explicitly call close?)
-    def __del__(self):
-        self.close()
+    #def __del__(self):
+        #await self.close()
 
     def database(self, number=0, encoder=None, decoder=None, retries=3):
         return Database(self, number, encoder, decoder, retries)
 
-    def pubsub(self):
-        if self._pubsub is None:
-            with self._lock:
-                if self._pubsub is None:
-                    self._pubsub = PubSub(self)
-        return self._pubsub
-
-    def _send_command(self, cmd):
+    async def _send_command(self, cmd):
         if self._connection is None or self._connection.closed:
-            with self._lock:
+            async with self._lock:
                 if self._connection is None or self._connection.closed:
-                    self._connection = Connection.create(self._endpoints[0], self._configuration)
-        self._connection.send(cmd)
+                    self._connection = await Connection.create(self._endpoints[0], self._configuration)
+        await self._connection.send(cmd)
 
 
 class Database(object):
@@ -489,14 +485,14 @@ class Database(object):
         self._scripts = multiplexer._scripts
         self._scripts_sha = multiplexer._scripts_sha
 
-    def command(self, *args, **kwargs):
+    async def command(self, *args, **kwargs):
         cmd = parse_command(self, *args, **kwargs)
-        self._multiplexer._send_command(cmd)
+        await self._multiplexer._send_command(cmd)
         return cmd
 
-    def commandreply(self, *args, **kwargs):
-        cmd = self.command(*args, **kwargs)
-        return cmd()
+    async def commandreply(self, *args, **kwargs):
+        cmd = await self.command(*args, **kwargs)
+        return await cmd()
 
     def multi(self, retries=None):
         return MultiCommand(self, retries if retries is not None else self._retries)
@@ -523,13 +519,13 @@ class MultiCommand(object):
     def get_number(self):
         return self._database._number
 
-    def set_result(self, result, dont_retry=False):
+    async def set_result(self, result, dont_retry=False):
         # TODO (misc) If there is an exec error, maybe preserve the original per-cmd error as well ?
         if isinstance(result, list):
             exec_res = result[-1]
             if isinstance(exec_res, list):
                 for cmd, res in zip(self._cmds[1:-1], exec_res):
-                    cmd.set_result([res], dont_retry=True)
+                    await cmd.set_result([res], dont_retry=True)
                 self._database = None
                 self._cmds = None
                 return
@@ -539,40 +535,40 @@ class MultiCommand(object):
         if self._database and not dont_retry and self._retries and isinstance(exec_res, command_retry_errors):
             self._retries -= 1
             if not isinstance(exec_res, RedisReplyError):
-                self._database._multiplexer._send_command(self)
+                await self._database._multiplexer._send_command(self)
                 return
 
         for cmd in self._cmds[1:-1]:
-            cmd.set_result(exec_res, dont_retry=True)
+            await cmd.set_result(exec_res, dont_retry=True)
         self._database = None
         self._cmds = None
 
     def how_many_results(self):
         return len(self._cmds)
 
-    def __enter__(self):
+    async def __aenter__(self):
         if self._done:
             raise RedisError('Multiple command already finished')
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    async def __aexit__(self, exc_type, exc_value, traceback):
         if not exc_type:
-            self.execute(True)
+            await self.execute(True)
         else:
-            self.discard(True)
+            await self.discard(True)
 
-    def discard(self, soft=False):
+    async def discard(self, soft=False):
         if self._done:
             if soft:
                 return
             raise RedisError('Multiple command already finished')
         for cmd in self._cmds:
-            cmd.set_result(RedisError('Multiple command aborted'), dont_retry=True)
+            await cmd.set_result(RedisError('Multiple command aborted'), dont_retry=True)
         self._cmds = []
         self._database = None
         self._done = True
 
-    def execute(self, soft=False):
+    async def execute(self, soft=False):
         if self._done:
             if soft:
                 return
@@ -583,7 +579,7 @@ class MultiCommand(object):
             e_cmd = Command((b'EXEC', ), self._database)
             self._cmds.insert(0, m_cmd)
             self._cmds.append(e_cmd)
-            self._database._multiplexer._send_command(self)
+            await self._database._multiplexer._send_command(self)
 
     def command(self, *args, **kwargs):
         if self._done:
@@ -591,80 +587,3 @@ class MultiCommand(object):
         cmd = parse_command(self._database, *args, **kwargs)
         self._cmds.append(cmd)
         return cmd
-
-
-# TODO how to handle retries on I/O errors ?
-# TODO the multiplexer .close should close this as well
-# TODO encoding?
-# TODO should I have a registration object ? (per object lifetime)
-# This is a global instance per multiplexer
-class PubSub(object):
-    __slots__ = '_multiplexer', '_channels', '_patterns', '_connection', '_lock'
-
-    def __init__(self, multiplexer):
-        self._multiplexer = multiplexer
-        self._channels = set()
-        self._patterns = set()
-        self._connection = None
-        self._lock = Lock()
-
-    def create_connection(self):
-        if self._connection is None or self._connection.closed:
-            with self._lock:
-                if self._connection is None or self._connection.closed:
-                    self._connection = Connection.create(self._multiplexer._endpoints[0], self._multiplexer._configuration)
-                    return True
-        return False
-
-    def _command(self, cmd, *args):
-        if self.create_connection():
-            if self._channels:
-                cmd = Command((b'SUBSCRIBE', ) + tuple(self._channels), enqueue=False, retries=0)
-                self._connection.send(cmd)
-            if self._patterns:
-                cmd = Command((b'PSUBSCRIBE', ) + tuple(self._patterns), enqueue=False, retries=0)
-                self._connection.send(cmd)
-        # If it's a new connection, it will already run the command in the given list above
-        else:
-            cmd = Command((cmd, ) + args, enqueue=False, retries=0)
-            self._connection.send(cmd)
-        if not self._channels and not self._patterns:
-            self._connection.close()
-
-    def subscribe(self, *channels):
-        self._channels.update(channels)
-        self._command(b'SUBSCRIBE', *channels)
-
-    def unsubscribe(self, *channels):
-        if not channels:
-            self._channels = set()
-        else:
-            self._channels -= set(channels)
-        self._command(b'UNSUBSCRIBE', *channels)
-    
-    def psubscribe(self, *patterns):
-        self._patterns.update(_patterns)
-        self._command(b'PSUBSCRIBE', *_patterns)
-    
-    def punsubscribe(self, *patterns):
-        if not patterns:
-            self._patterns = set()
-        else:
-            self._patterns -= set(_patterns)
-        self._command(b'PUNSUBSCRIBE', *_patterns)
-    
-    def ping(self, msg=None):
-        if msg:
-            self._command(b'PING', msg)
-        else:
-            self._command(b'PING')
-
-    def message(self, timeout=None):
-        res = self._connection.recv(allow_empty=True)
-        if res is False:
-            if self._connection.wait(timeout):
-                return self._connection.recv()
-            else:
-                return None
-        else:
-            return res
