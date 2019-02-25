@@ -7,18 +7,19 @@ global_set = False
 
 def builtin():
     import socket
-    from threading import Lock
+    from threading import Lock, Event
     from select import select
 
     env = {}
     env["socket"] = socket
     env["Lock"] = Lock
+    env["Event"] = Event
     env["select"] = select
     return env
 
 
 def gevent():
-    raise NotImplementedError("Not implmented yet")
+    raise NotImplementedError("Not implemented yet")
 
 
 def get_env(*args):

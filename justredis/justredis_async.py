@@ -3,7 +3,7 @@ import sys
 from collections import deque
 from hashlib import sha1
 import warnings
-from asyncio import open_connection, Lock
+from asyncio import open_connection, open_unix_connection, Lock
 import socket
 
 import hiredis
@@ -231,6 +231,7 @@ class Connection(object):
         while connectretry:
             try:
                 if isinstance(endpoint, str):
+                    self.reader, self.writer = await open_unix_connection(endpoint)
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     sock.settimeout(connecttimeout)
                     sock.connect(endpoint)
