@@ -6,11 +6,11 @@ import warnings
 
 import hiredis
 
-from .environment import get_env
 
-# TODO how to do this lazy ?
-# TODO add optional thread for non cooperative loop
-Lock, Event, socket, select = get_env("Lock", "Event", "socket", "select")
+# Execution environment
+from .environment import get_env
+Lock, Event, socket, select, thread = get_env("Lock", "Event", "socket", "select", "thread")
+
 
 # Exceptions
 # An error response from the redis server
@@ -161,8 +161,6 @@ def hiredis_parser():
 
 # TODO better handling for unix domain, and default ports in tuple / list
 def parse_uri(uri):
-    if isinstance(uri, Connection):
-        return uri
     endpoints = []
     config = {}
     if isinstance(uri, dict):
@@ -189,15 +187,15 @@ def parse_uri(uri):
 def parse_command(source, *args, **kwargs):
     if not args:
         raise RedisError('Empty command not allowed')
-    # First argument should always be utf-8 encoded english?
+    # TODO First argument should always be utf-8 encoded english?
     cmd = args[0]
     cmd = (cmd if isinstance(cmd, bytes) else cmd.encode()).upper()
     if cmd in not_allowed_commands:
         raise RedisError('Command is not allowed')
     encoder = source._encoder
     decoder = source._decoder
-    retries = source._retries
     throw = True
+    retries = source._retries
     if kwargs:
         encoder = kwargs.get('encoder', encoder)
         decoder = kwargs.get('decoder', decoder)
@@ -219,6 +217,7 @@ def parse_command(source, *args, **kwargs):
 
 
 class Connection(object):
+    __slots__ = 'socket', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'buffer', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
     @classmethod
     def create(cls, endpoint, config):
         connectionhandler = config.get('connectionhandler', cls)
@@ -269,6 +268,10 @@ class Connection(object):
         self.parser.send(None)
         self.lastdatabase = 0
         self.select = select
+        self.thread_event = None
+        if thread:
+            self.thread_event = Event()
+            self.thread = thread(self.loop)
         password = config.get('password')
         if password is not None:
             cmd = Command((b'AUTH', password))
@@ -278,6 +281,17 @@ class Connection(object):
             except:
                 self.close()
                 raise
+
+    # This should be exception safe
+    def loop(self):
+        while True:
+            self.thread_event.wait()
+            self.thread_event.clear()
+            if self.closed:
+                return
+            while True:
+                if not self.resolve():
+                    break
 
     # Don't accept any new commands, but the read stream might still be alive
     def close_write(self):
@@ -299,6 +313,8 @@ class Connection(object):
                             # This are already sent and we don't know if they happened or not.
                             command.set_result(RedisError('Connection closed'), dont_retry=True)
                         self.commands = []
+            if self.thread_event:
+                self.thread_event.set()
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
     def send(self, cmd):
@@ -318,6 +334,8 @@ class Connection(object):
                 # This is for pub/sub to not expect a result
                 if cmd._enqueue:
                     self.commands.append(cmd)
+                if self.thread_event:
+                    self.thread_event.set()
         except Exception as e:
             self.close_write()
             cmd.set_result(e)
@@ -606,13 +624,17 @@ class MultiCommand(object):
 # TODO ping ? just use keepalive ?
 # TODO decoding / encoding per instance !
 # TODO keys must be binaries, what does hiredis do ?
+
+# TODO deadlock because waiting on message, and add/ing removing instances same lock !
 class PubSub(object):
-    __slots__ = '_multiplexer', '_connection', '_lock', '_registered_instances', '_registered_channels', '_registered_patterns'
+    __slots__ = '_multiplexer', '_connection', '_lock', '_msg_lock', '_msg_waiting', '_registered_instances', '_registered_channels', '_registered_patterns'
 
     def __init__(self, multiplexer):
         self._multiplexer = multiplexer
         self._connection = None
         self._lock = Lock()
+        self._msg_lock = Lock()
+        self._msg_waiting = Event()
         self._registered_instances = {}
         self._registered_channels = {}
         self._registered_patterns = {}
@@ -640,27 +662,39 @@ class PubSub(object):
         if not self._registered_channels and not self._registered_patterns:
             self._connection.close()
     
-    # TODO this is a timing mess in cooporative mode
-    def message(self, instance, timeout=None):
-        try:
-            got_lock = self._lock.acquire(False)
-            if not got_lock:
-                return instance._wait(timeout)
-            res = self._connection.recv(allow_empty=True)
-            if res is False:
-                if self._connection.wait(timeout):
-                    res = self._connection.recv()
-                else:
-                    res = None
-            if res:
-                if res[0] == 'message':
-                    for instance in self._registered_channels[res[1]]:
-                        instance._add_message(res)
-                elif res[0] == 'pmessage':
-                    for instance in self._registered_patterns[res[1]]:
-                        instance._add_message(res)
-        finally:
-            self._lock.release()
+    # TODO handle i/o error (reconnect / resubscribe with main lock, at start)
+    def message(self, instance, max_timeout=None):
+        stop = False if max_timeout is None else True
+        while max_timeout is None or stop:
+            try:
+                got_lock = self._msg_lock.acquire(False)
+                if not got_lock:
+                    return self._msg_waiting.wait(max_timeout)
+                res = self._connection.recv(allow_empty=True)
+                if res is False:
+                    if self._connection.wait(max_timeout):
+                        res = self._connection.recv()
+                    else:
+                        res = None
+                if res:
+                    if res[0] == b'message':
+                        with self._lock:
+                            for _instance in self._registered_channels[res[1]]:
+                                _instance._add_message(res)
+                                if instance == _instance:
+                                    stop = True
+                    elif res[0] == b'pmessage':
+                        with self._lock:
+                            for _instance in self._registered_patterns[res[1]]:
+                                _instance._add_message(res)
+                                if instance == _instance:
+                                    stop = True
+                if stop:
+                    break
+            finally:
+                if got_lock:
+                    self._msg_lock.release()
+        self._msg_waiting.set()
 
     # If in register / unregister there is an I/O at least it's bookkeeped first so later invocations will fix it
     def register(self, instance, channels, patterns):
@@ -699,16 +733,17 @@ class PubSub(object):
 
 
 class PubSubInstance(object):
-    __slots__ = '_pubsub', '_closed', '_event', '_messages'
+    __slots__ = '_pubsub', '_closed', '_messages'
 
     def __init__(self, pubsub, channels=None, patterns=None):
-        if not getattr(channels, '__iter__', False):
+        if not isinstance(channels, (list, tuple)):
             channels = [channels]
-        if not getattr(patterns, '__iter__', False):
+        if not isinstance(patterns, (list, tuple)):
             patterns = [patterns]
+        channels = [utf8_encode(x) for x in channels]
+        patterns = [utf8_encode(x) for x in patterns]
         self._pubsub = pubsub
         self._closed = False
-        self._event = Event()
         self._messages = deque()
         self._pubsub.register(self, channels, patterns)
 
@@ -724,25 +759,24 @@ class PubSubInstance(object):
                 pass
             self._pubsub = None
 
+    def add_channel(self, channel):
+        pass
+
+    def add_pattern(self, pattern):
+        pass
+
     def _add_message(self, msg):
         self._messages.append(msg)
-        self._event.set()
-
-    def _wait(self, timeout=None):
-        return self._event._wait(timeout)
 
     # Don't pass this between different invocation contexts
-    def message(self, timeout=None):
+    def message(self, max_timeout=None):
         if self._closed:
             raise RedisError('Pub/sub instance closed')
-        while True:
+        try:
+            return self._messages.popleft()
+        except IndexError:
+            self._pubsub.message(self, max_timeout)
             try:
                 return self._messages.popleft()
             except IndexError:
-                if self._pubsub.message(self, timeout):
-                    # TODO might fail on previous event notification..
-                    return self._messages.popleft()
-                if timeout:
-                    return None
-#                else:
-#                    return None
+                return None
