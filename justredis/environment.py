@@ -1,7 +1,10 @@
-import os
+import sys
 
-
-global_env_default = os.environ.get('JUSTREDIS_ENV') or "builtin"
+global_env_default = "builtin"
+if 'gevent' in sys.modules:
+    global_env_default = "gevent"
+elif 'threading' in sys.modules:
+    global_env_default = "builtin_with_threads"
 
 
 global_env = "notset"
