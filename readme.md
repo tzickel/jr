@@ -5,6 +5,7 @@ An asynchronous redis client library for Python 2.7 and 3.5+
 * All commands are pipelined (asynchronous)
 * No connection pool, a single connection per redis instance even between different execution contexts (extra one if using pub/sub)
 * Optional per command encoding / decoding / retries
+* Supports several execution contexts: cooperative multitasking, normal multithreading, gevent and pluggable support for others
 
 # Also supports
 * Pub/Sub
@@ -25,7 +26,7 @@ An asynchronous redis client library for Python 2.7 and 3.5+
 - [ ] Resp V3 ?
 
 # Example
-This example uses an cooperative asynchronous syntax which is compatible with Python 2.7. You can call () a redis command to resolve it's reply (or not if you don't care about the result).
+This example uses an asynchronous syntax which is compatible with Python 2.7. You can call () on a redis command to resolve it's reply (or not if you don't care about the result).
 
 ```python
 from justredis import Multiplexer, utf8_bytes_as_strings

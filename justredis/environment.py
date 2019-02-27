@@ -32,6 +32,7 @@ def builtin_with_threads():
 
     def thread(target):
         t = Thread(target=target)
+        t.daemon = True
         t.start()
         return t
 

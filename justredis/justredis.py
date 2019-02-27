@@ -2,7 +2,7 @@ from __future__ import absolute_import
 import sys
 from collections import deque
 from hashlib import sha1
-import warnings
+from binascii import crc_hqx as calc_hash
 
 import hiredis
 
@@ -55,6 +55,10 @@ command_retry_errors = (Exception)
 platform = ''
 if sys.platform.startswith('linux'):
     platform = 'linux'
+elif sys.platform.startswith('darwin'):
+    platform = 'darwin'
+elif sys.platform.startswith('win'):
+    platform = 'windows'
 
 
 not_allowed_commands = (b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT')
@@ -229,6 +233,7 @@ class Connection(object):
         sockettimeout = config.get('sockettimeout', socket.getdefaulttimeout())
         buffersize = config.get('recvbuffersize', 16384)
         tcpkeepalive = config.get('tcpkeepalive', 300)
+        tcpnodelay = config.get('tcpnodelay', False)
         while connectretry:
             try:
                 if isinstance(endpoint, str):
@@ -249,15 +254,19 @@ class Connection(object):
                     raise RedisError('Connection failed: %r' % e)
         # needed for cluster support
         self.name = self.socket.getpeername()
-        if tcpkeepalive:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            # TODO support other platforms (atleast windows)
-            if platform == 'linux':
-                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, tcpkeepalive)
-                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, tcpkeepalive // 3)
-                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-            else:
-                warnings.warn("TCP keepalive supports on linux for now")
+        if isinstance(self.socket.getsockname(), tuple):
+            if tcpnodelay:
+                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if tcpkeepalive:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if platform == 'linux':
+                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, tcpkeepalive)
+                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, tcpkeepalive // 3)
+                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                elif platform == 'darwin':
+                    self.socket.setsockopt(socket.IPPROTO_TCP, 0x10, tcpkeepalive // 3)
+                elif platform == 'windows':
+                    self.socket.ioctl(SIO_KEEPALIVE_VALS, (1, tcpkeepalive * 1000, tcpkeepalive // 3 * 1000))
         self.commands = deque()
         self.closed = False
         self.read_lock = Lock()
@@ -398,6 +407,11 @@ class Command(object):
     def get_number(self):
         return self._database._number if self._database else None
     
+    # TODO use this all over the code
+    # TODO replace the _data with the already encoded data ?
+    def get_index_as_bytes(self, index):
+        return self._encoder(self._data[index])
+
     def how_many_results(self):
         return 1
 
@@ -455,7 +469,7 @@ class Command(object):
 
 
 class Multiplexer(object):
-    __slots__ = '_endpoints', '_configuration', '_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock'
+#    __slots__ = '_endpoints', '_configuration', '_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache'
 
     def __init__(self, configuration=None):
         self._endpoints, self._configuration = parse_uri(configuration)
@@ -465,6 +479,10 @@ class Multiplexer(object):
         self._scripts_sha = {}
         self._pubsub = None
         self._lock = Lock()
+        self._clustered = None
+        self._command_cache = {}
+        self._already_asking_for_slots = False
+        self._slots = []
 
     def close(self):
         if self._connection:
@@ -496,7 +514,79 @@ class Multiplexer(object):
             with self._lock:
                 if self._connection is None or self._connection.closed:
                     self._connection = Connection.create(self._endpoints[0], self._configuration)
+                    self._update_slots()
+        hashslot = self._get_command_from_cache(cmd)
         self._connection.send(cmd)
+
+    def _update_slots(self, moved_hint=None):
+        if self._clustered is False:
+            return
+        if self._already_asking_for_slots:
+            return
+        # We might already know about this move after this command was originally issued, from other commands
+        if moved_hint and self._slots:
+            hashslot, addr = moved_hint
+            for slot in self._slots:
+                if hashslot > slot[0]:
+                    continue
+                break
+            # We already know this, don't retry getting a new world view
+            if addr == slot[1]:
+                return
+        try:
+            # multiple commands can trigger this while in queue so we make sure to do it once
+            self._already_asking_for_slots = True
+            # TODO should we retry on some type of errors ?
+            cmd = Command((b'CLUSTER', b'SLOTS'))
+            # TODO maybe do like getcommandfromcache?
+            self._send_command(cmd)
+            try:
+                slots = cmd()
+                self._clustered = True
+            except RedisReplyError:
+                slots = []
+                self._clustered = False
+            slots.sort(key=lambda x: x[0])
+            slots = [(x[1], (x[2][0].decode(), x[2][1])) for x in slots]
+            self._slots = slots
+            return
+            # TODO fix this !!
+            # release hosts not here from previous connections
+            remove_connections = set(self.connections) - set([x[1] for x in slots])
+            # TODO is this ok after connectionpool rewrite
+            for entry in remove_connections:
+                # the pop will make this not accept already in use sockets back
+                connections = self.connections.pop(entry)
+                connections.close()
+                #for conn in connections:
+                    #conn.close()
+                #connections.clear()
+            self._slots = slots
+        finally:
+            self._already_asking_for_slots = False
+
+    # It is unreasonable to expect the user to provide us with the key index for each command so we ask the server and cache it
+    # TODO what to do in MULTI case ? maybe this should be in Command itself
+    def _get_command_from_cache(self, cmd):
+        if self._clustered is not True:
+            return None
+        command_name = cmd.get_index_as_bytes(0)
+        keyindex = self._command_cache.get(command_name)
+        if keyindex is None:
+            # Requires redis server 2.8.13 or above
+            # allow retries? might be infinite loop...
+            info_cmd = Command((b'COMMAND', b'INFO', command_name))
+            # If connection is dead, then the initiator command should retry
+            self._connection.send(info_cmd)
+            cmdinfo = info_cmd()[0]
+            # If the server does not know the command, we can't redirect it properly in cluster mode
+            keyindex = cmdinfo[3] if cmdinfo else 0
+            self._command_cache[command_name] = keyindex
+        if keyindex == 0:
+            return None
+        # TODO (error) if keyindex does not exist, should we ignore it ?
+        key = cmd.get_index_as_bytes(keyindex)
+        return calc_hash(key, 0)
 
 
 class Database(object):
@@ -627,7 +717,7 @@ class MultiCommand(object):
 
 # TODO deadlock because waiting on message, and add/ing removing instances same lock !
 class PubSub(object):
-    __slots__ = '_multiplexer', '_connection', '_lock', '_msg_lock', '_msg_waiting', '_registered_instances', '_registered_channels', '_registered_patterns'
+    __slots__ = '_multiplexer', '_connection', '_lock', '_msg_lock', '_msg_waiting', '_registered_instances', '_registered_channels', '_registered_patterns', '_thread'
 
     def __init__(self, multiplexer):
         self._multiplexer = multiplexer
@@ -638,6 +728,8 @@ class PubSub(object):
         self._registered_instances = {}
         self._registered_channels = {}
         self._registered_patterns = {}
+        if thread:
+            self._thread = thread(self.loop)
 
     def create_connection(self):
         if self._connection is None or self._connection.closed:
@@ -695,6 +787,10 @@ class PubSub(object):
                 if got_lock:
                     self._msg_lock.release()
         self._msg_waiting.set()
+
+    def loop(self):
+        while True:
+            self.message(None)
 
     # If in register / unregister there is an I/O at least it's bookkeeped first so later invocations will fix it
     def register(self, instance, channels, patterns):

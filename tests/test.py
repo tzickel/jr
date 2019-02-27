@@ -169,5 +169,24 @@ class TestServerWithPassword(unittest.TestCase):
             cmd()
 
 
+class TestCluster(unittest.TestCase):
+    def setUp(self):
+        self.servers = start_cluster(3)
+        self.mp = Multiplexer({'endpoints': ('localhost', self.servers[0].port)})
+
+    def tearDown(self):
+        self.mp = None
+        self.servers = None
+
+    def test_basic(self):
+        c = self.mp.database().command
+        cmd = c(b'set', b'a', b'b')
+        self.assertEqual(cmd(), b'OK')
+        cmd = c(b'set', b'b', b'b')
+        self.assertEqual(cmd(), b'OK')
+        cmd = c(b'set', b'c', b'b')
+        self.assertEqual(cmd(), b'OK')
+
+
 if __name__ == '__main__':
     unittest.main()
