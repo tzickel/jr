@@ -2,7 +2,8 @@ from __future__ import absolute_import
 import sys
 from collections import deque
 from hashlib import sha1
-from binascii import crc_hqx as calc_hash
+# binascii requires python to be compiled with zlib ?
+from binascii import crc_hqx
 
 import hiredis
 
@@ -161,6 +162,17 @@ def hiredis_parser():
         data = yield res
         if data:
             reader.feed(*data)
+
+
+# Cluster hash calculation
+def calc_hash(key):
+    try:
+        s = key.index(b'{')
+        e = key[s + 1:].index(b'}')
+        key = key[s + 1: e - 1]
+    except ValueError:
+        pass
+    return crc_hqx(key, 0) % 16384
 
 
 # TODO better handling for unix domain, and default ports in tuple / list
@@ -473,7 +485,9 @@ class Multiplexer(object):
 
     def __init__(self, configuration=None):
         self._endpoints, self._configuration = parse_uri(configuration)
-        self._connection = None
+        self._connections = {}
+        self._last_connection = None
+        self._tryindex = 0
         # The reason we do double dictionary here is for faster lookup in case of lookup failure and multi threading protection
         self._scripts = {}
         self._scripts_sha = {}
@@ -485,19 +499,23 @@ class Multiplexer(object):
         self._slots = []
 
     def close(self):
-        if self._connection:
+        if self._connections:
             with self._lock:
                 try:
-                    self._connection.close()
+                    for connection in self._connections.values():
+                        connection.close()
                 except Exception:
                     pass
-                self._connection = None
+                self._connections = {}
+                self._last_connection = None
 
     # TODO (misc) is this sane or we should not support this (explicitly call close?)
     def __del__(self):
         self.close()
 
     def database(self, number=0, encoder=None, decoder=None, retries=3):
+        if number != 0 and self._clustered:
+            raise RedisError('Redis cluster has no database selection support')
         return Database(self, number, encoder, decoder, retries)
 
     def pubsub(self, channels=None, patterns=None):
@@ -509,16 +527,70 @@ class Multiplexer(object):
                     self._pubsub = PubSub(self)
         return PubSubInstance(self._pubsub, channels, patterns)
 
-    def _send_command(self, cmd):
-        if self._connection is None or self._connection.closed:
-            with self._lock:
-                if self._connection is None or self._connection.closed:
-                    self._connection = Connection.create(self._endpoints[0], self._configuration)
-                    self._update_slots()
-        hashslot = self._get_command_from_cache(cmd)
-        self._connection.send(cmd)
+    def _get_connection(self, hashslot=None):
+        if not hashslot:
+            if self._last_connection is None or self._last_connection.closed:
+                with self._lock:
+                    if self._last_connection is None or self._last_connection.closed:
+                        # TODO should we enumerate self._uri or self.connections (which is not populated, maybe populate at start and avoid cluster problems)
+                        for num, addr in enumerate(list(self._endpoints)):
+                            self._tryindex = num
+                            try:
+                                conn = self._connections.get(addr)
+                                if not conn or conn.closed:
+                                    conn = Connection.create(addr, self._configuration)
+                                    # TODO is the name correct here? (in ipv4 yes, in ipv6 no ?)
+                                    self._last_connection = self._connections[conn.name] = conn
+                                    self._last_connection = conn
+                                    # TODO reset each time?
+                                    if self._clustered is None:
+                                        self._update_slots(with_connection=conn)
+                                    return conn
+                            except Exception:
+                                try:
+                                    conn.close()
+                                except:
+                                    pass
+                                self._connections.pop(addr, None)
+                        self._last_connection = None
+                        raise RedisError('Could not find any connection')
+            return self._last_connection
+        else:
+            if not self._slots:
+                self._update_slots()
+            for slot in self._slots:
+                if hashslot > slot[0]:
+                    continue
+                break
+            addr = slot[1]
+            try:
+                conn = self._connections.get(addr)
+                if not conn or conn.closed:
+                    #TODO lock per conn
+                    with self._lock:
+                        conn = self._connections.get(addr)
+                        if not conn or conn.closed:
+                            conn = Connection.create(addr, self._configuration)
+                            self._connections[addr] = conn
+                return conn
+            # TODO (misc) should we try getting another connection here ?
+            except Exception:
+                self.update_slots()
+                raise
 
-    def _update_slots(self, moved_hint=None):
+    # TODO TRY MULTICOMMAND AS FIRST ONE?
+    def _send_command(self, cmd):
+        if isinstance(cmd, MultiCommand) and self._clustered is not False:
+            for acmd in cmd._cmds[1:-1]:
+                hashslot = self._get_command_from_cache(acmd)
+                if hashslot is not None:
+                    break
+        else:
+            hashslot = self._get_command_from_cache(cmd)
+        connection = self._get_connection(hashslot)
+        connection.send(cmd)
+
+    def _update_slots(self, moved_hint=None, with_connection=None):
         if self._clustered is False:
             return
         if self._already_asking_for_slots:
@@ -538,8 +610,9 @@ class Multiplexer(object):
             self._already_asking_for_slots = True
             # TODO should we retry on some type of errors ?
             cmd = Command((b'CLUSTER', b'SLOTS'))
-            # TODO maybe do like getcommandfromcache?
-            self._send_command(cmd)
+            # TODO with_connection should be forced ?
+            connection = with_connection or self._get_connection()
+            connection.send(cmd)
             try:
                 slots = cmd()
                 self._clustered = True
@@ -568,7 +641,7 @@ class Multiplexer(object):
     # It is unreasonable to expect the user to provide us with the key index for each command so we ask the server and cache it
     # TODO what to do in MULTI case ? maybe this should be in Command itself
     def _get_command_from_cache(self, cmd):
-        if self._clustered is not True:
+        if self._clustered is False:
             return None
         command_name = cmd.get_index_as_bytes(0)
         keyindex = self._command_cache.get(command_name)
@@ -577,7 +650,10 @@ class Multiplexer(object):
             # allow retries? might be infinite loop...
             info_cmd = Command((b'COMMAND', b'INFO', command_name))
             # If connection is dead, then the initiator command should retry
-            self._connection.send(info_cmd)
+            self._get_connection().send(info_cmd)
+            # We do this check here, since _get_connection first try will trigger a clustred check and we need to abort if it's not (to not trigger the send_command's hashslot)
+            if self._clustered is False:
+                return None
             cmdinfo = info_cmd()[0]
             # If the server does not know the command, we can't redirect it properly in cluster mode
             keyindex = cmdinfo[3] if cmdinfo else 0
@@ -586,7 +662,7 @@ class Multiplexer(object):
             return None
         # TODO (error) if keyindex does not exist, should we ignore it ?
         key = cmd.get_index_as_bytes(keyindex)
-        return calc_hash(key, 0)
+        return calc_hash(key)
 
 
 class Database(object):

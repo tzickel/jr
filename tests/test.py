@@ -102,10 +102,12 @@ class TestServerWithPassword(unittest.TestCase):
 
     def test_wrongpassword(self):
         mp = Multiplexer({'endpoints': ('localhost', self.server.port), 'password': 'wrong'})
-        with self.assertRaises(RedisReplyError):
+#        with self.assertRaises(RedisReplyError):
+        with self.assertRaises(RedisError):
             mp.database(0).command(b'GET', b'a')()
         mp = Multiplexer({'endpoints': ('localhost', self.server.port)})
         with self.assertRaises(RedisReplyError):
+#        with self.assertRaises(RedisError):
             mp.database(0).command(b'GET', b'a')()
 
     def test_simple(self):
@@ -172,7 +174,7 @@ class TestServerWithPassword(unittest.TestCase):
 class TestCluster(unittest.TestCase):
     def setUp(self):
         self.servers = start_cluster(3)
-        self.mp = Multiplexer({'endpoints': ('localhost', self.servers[0].port)})
+        self.mp = Multiplexer({'endpoints': ('127.0.0.1', self.servers[0].port)})
 
     def tearDown(self):
         self.mp = None

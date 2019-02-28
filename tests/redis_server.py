@@ -3,12 +3,13 @@ import random
 import os
 
 
-def start_cluster(masters, dockerimage=None, extraparams=''):
+def start_cluster(masters, dockerimage=None, extraparams='', ipv4=True):
+    addr = '127.0.0.1' if ipv4 else '::1'
     ret = []
     subprocess.call('rm /tmp/blah*.conf', shell=True)
     for x in range(masters):
         ret.append(RedisServer(extraparams='--cluster-enabled yes --cluster-config-file /tmp/blah%d.conf' % x))
-    subprocess.Popen('redis-cli --cluster create ' + ' '.join(['127.0.0.1:%d' % server.port for server in ret]), stdin=subprocess.PIPE, shell=True).communicate(b'yes\n')
+    subprocess.Popen('redis-cli --cluster create ' + ' '.join(['%s:%d' % (addr, server.port) for server in ret]), stdin=subprocess.PIPE, shell=True).communicate(b'yes\n')
     return ret
 
 
