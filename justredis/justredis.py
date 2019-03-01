@@ -518,14 +518,12 @@ class Multiplexer(object):
             raise RedisError('Redis cluster has no database selection support')
         return Database(self, number, encoder, decoder, retries)
 
-    def pubsub(self, channels=None, patterns=None):
-        if not channels and not patterns:
-            raise RedisError('No channels or patterns given')
+    def pubsub(self):
         if self._pubsub is None:
             with self._lock:
                 if self._pubsub is None:
                     self._pubsub = PubSub(self)
-        return PubSubInstance(self._pubsub, channels, patterns)
+        return PubSubInstance(self._pubsub)
 
     def _get_connection(self, hashslot=None):
         if not hashslot:
@@ -793,7 +791,7 @@ class MultiCommand(object):
 
 # TODO deadlock because waiting on message, and add/ing removing instances same lock !
 class PubSub(object):
-    __slots__ = '_multiplexer', '_connection', '_lock', '_msg_lock', '_msg_waiting', '_registered_instances', '_registered_channels', '_registered_patterns', '_thread'
+#    __slots__ = '_multiplexer', '_connection', '_lock', '_msg_lock', '_msg_waiting', '_registered_instances', '_registered_channels', '_registered_patterns', '_thread'
 
     def __init__(self, multiplexer):
         self._multiplexer = multiplexer
@@ -823,12 +821,15 @@ class PubSub(object):
             if patterns:
                 cmd = Command((b'PSUBSCRIBE', ) + tuple(patterns), enqueue=False, retries=0)
                 self._connection.send(cmd)
+            ret = True
         # If it's a new connection, it will already run the command in the given list above
         else:
             cmd = Command((cmd, ) + args, enqueue=False, retries=0)
             self._connection.send(cmd)
+            ret = False
         if not self._registered_channels and not self._registered_patterns:
             self._connection.close()
+        return ret
     
     # TODO handle i/o error (reconnect / resubscribe with main lock, at start)
     def message(self, instance, max_timeout=None):
@@ -845,6 +846,7 @@ class PubSub(object):
                     else:
                         res = None
                 if res:
+                    # The reason we send subscribe messages as well, is to know when an I/O reconnection has occurred
                     if res[0] == b'message':
                         with self._lock:
                             for _instance in self._registered_channels[res[1]]:
@@ -852,6 +854,18 @@ class PubSub(object):
                                 if instance == _instance:
                                     stop = True
                     elif res[0] == b'pmessage':
+                        with self._lock:
+                            for _instance in self._registered_patterns[res[1]]:
+                                _instance._add_message(res)
+                                if instance == _instance:
+                                    stop = True
+                    elif res[0] == b'subscribe':
+                        with self._lock:
+                            for _instance in self._registered_channels[res[1]]:
+                                _instance._add_message(res)
+                                if instance == _instance:
+                                    stop = True
+                    elif res[0] == b'psubscribe':
                         with self._lock:
                             for _instance in self._registered_patterns[res[1]]:
                                 _instance._add_message(res)
@@ -871,7 +885,9 @@ class PubSub(object):
     # If in register / unregister there is an I/O at least it's bookkeeped first so later invocations will fix it
     def register(self, instance, channels, patterns):
         with self._lock:
-            self._registered_instances[instance] = [channels, patterns]
+            registered = self._registered_instances.get(instance, [set(), set()])
+            registered[0].update(channels)
+            registered[1].update(patterns)
             if channels:
                 for channel in channels:
                     self._registered_channels.setdefault(channel, set()).add(instance)
@@ -879,21 +895,27 @@ class PubSub(object):
                 for pattern in patterns:
                     self._registered_patterns.setdefault(pattern, set()).add(instance)
             if channels:
-                self._command(b'SUBSCRIBE', *channels)
+                # If this was a new connection, the channels were already registered
+                if self._command(b'SUBSCRIBE', *channels):
+                    return
             if patterns:
                 self._command(b'PSUBSCRIBE', *patterns)
 
-    def unregister(self, instance):
+    def unregister(self, instance, channels=None, patterns=None):
         with self._lock:
             channels_to_remove = []
             patterns_to_remove = []
-            channels, patterns = self._registered_instances.pop(instance)
-            for channel in channels:
+            registered_channels, registered_patterns = self._registered_instances.pop(instance)
+            for channel in registered_channels:
+                if channels and channel not in channels:
+                    continue
                 registered_channel = self._registered_channels[channel]
                 registered_channel.discard(instance)
                 if not registered_channel:
                     channels_to_remove.append(channel)
-            for pattern in patterns:
+            for pattern in registered_patterns:
+                if patterns and pattern not in patterns:
+                    continue
                 registered_pattern = self._registered_patterns[pattern]
                 registered_pattern.discard(instance)
                 if not registered_pattern:
@@ -907,17 +929,10 @@ class PubSub(object):
 class PubSubInstance(object):
     __slots__ = '_pubsub', '_closed', '_messages'
 
-    def __init__(self, pubsub, channels=None, patterns=None):
-        if not isinstance(channels, (list, tuple)):
-            channels = [channels]
-        if not isinstance(patterns, (list, tuple)):
-            patterns = [patterns]
-        channels = [utf8_encode(x) for x in channels]
-        patterns = [utf8_encode(x) for x in patterns]
+    def __init__(self, pubsub):
         self._pubsub = pubsub
         self._closed = False
         self._messages = deque()
-        self._pubsub.register(self, channels, patterns)
 
     def __del__(self):
         self.close()
@@ -931,11 +946,22 @@ class PubSubInstance(object):
                 pass
             self._pubsub = None
 
-    def add_channel(self, channel):
-        pass
+    def _cmd(self, cmd, channels, patterns):
+        if self._closed:
+            raise RedisError('Pub/sub instance closed')
+        if isinstance(channels, (unicode, str, bytes)):
+            channels = [channels]
+        if isinstance(patterns, (unicode, str, bytes)):
+            patterns = [patterns]
+        channels = [utf8_encode(x) for x in channels]
+        patterns = [utf8_encode(x) for x in patterns]
+        cmd(self, channels, patterns)
 
-    def add_pattern(self, pattern):
-        pass
+    def add(self, channels, patterns):
+        self._cmd(self._pubsub.register, channels, patterns)
+
+    def remove(self, channels, patterns):
+        self._cmd(self._pubsub.unregister, channels, patterns)
 
     def _add_message(self, msg):
         self._messages.append(msg)
