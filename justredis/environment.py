@@ -1,10 +1,11 @@
+# TODO add environment support os.environ and use it unittest
 import sys
 
 global_env_default = "builtin"
 if 'gevent' in sys.modules:
     global_env_default = "gevent"
-elif 'threading' in sys.modules:
-    global_env_default = "builtin_with_threads"
+#elif 'threading' in sys.modules:
+#4    global_env_default = "builtin_with_threads"
 
 
 global_env = "notset"

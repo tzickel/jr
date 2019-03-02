@@ -62,7 +62,8 @@ elif sys.platform.startswith('win'):
     platform = 'windows'
 
 
-not_allowed_commands = (b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT')
+# TODO change to set
+not_allowed_commands = (b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE')
 
 
 # Basic encoder
@@ -106,14 +107,14 @@ def encode_command(data, encoder):
     return output
 
 
-def chunk_encoded_command(cmd, chuck_size):
+def chunk_encoded_command(cmd, chunk_size):
     data = []
     data_len = 0
     for x in cmd.encode():
         chunk_len = len(x)
-        if data_len > chuck_size or chunk_len > chuck_size:
+        if data_len > chunk_size or chunk_len > chunk_size:
             yield b''.join(data)
-            if chunk_len > chuck_size:
+            if chunk_len > chunk_size:
                 yield x
                 data = []
                 data_len = 0
@@ -127,16 +128,16 @@ def chunk_encoded_command(cmd, chuck_size):
         yield b''.join(data)
 
 
-def chunk_encoded_commands(cmds, chuck_size):
+def chunk_encoded_commands(cmds, chunk_size):
     data = []
     data_len = 0
     cmd_index = 0
     for cmd in cmds:
         for x in cmd.encode():
             chunk_len = len(x)
-            if data_len > chuck_size or chunk_len > chuck_size:
+            if data_len > chunk_size or chunk_len > chunk_size:
                 yield b''.join(data)
-                if chunk_len > chuck_size:
+                if chunk_len > chunk_size:
                     yield x
                     data = []
                     data_len = 0
@@ -168,8 +169,9 @@ def hiredis_parser():
 def calc_hash(key):
     try:
         s = key.index(b'{')
-        e = key[s + 1:].index(b'}')
-        key = key[s + 1: e - 1]
+        e = key.index(b'}')
+        if e > s:
+            key = key[s + 1:e]
     except ValueError:
         pass
     return crc_hqx(key, 0) % 16384
@@ -883,9 +885,9 @@ class PubSub(object):
             self.message(None)
 
     # If in register / unregister there is an I/O at least it's bookkeeped first so later invocations will fix it
-    def register(self, instance, channels, patterns):
+    def register(self, instance, channels=None, patterns=None):
         with self._lock:
-            registered = self._registered_instances.get(instance, [set(), set()])
+            registered = self._registered_instances.setdefault(instance, [set(), set()])
             registered[0].update(channels)
             registered[1].update(patterns)
             if channels:
@@ -949,18 +951,20 @@ class PubSubInstance(object):
     def _cmd(self, cmd, channels, patterns):
         if self._closed:
             raise RedisError('Pub/sub instance closed')
-        if isinstance(channels, (unicode, str, bytes)):
-            channels = [channels]
-        if isinstance(patterns, (unicode, str, bytes)):
-            patterns = [patterns]
-        channels = [utf8_encode(x) for x in channels]
-        patterns = [utf8_encode(x) for x in patterns]
+        if channels:
+            if isinstance(channels, (unicode, str, bytes)):
+                channels = [channels]
+            channels = [utf8_encode(x) for x in channels]
+        if patterns:
+            if isinstance(patterns, (unicode, str, bytes)):
+                patterns = [patterns]
+            patterns = [utf8_encode(x) for x in patterns]
         cmd(self, channels, patterns)
 
-    def add(self, channels, patterns):
+    def add(self, channels=None, patterns=None):
         self._cmd(self._pubsub.register, channels, patterns)
 
-    def remove(self, channels, patterns):
+    def remove(self, channels=None, patterns=None):
         self._cmd(self._pubsub.unregister, channels, patterns)
 
     def _add_message(self, msg):

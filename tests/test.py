@@ -1,6 +1,7 @@
 #TODO check exception error msgs (https://github.com/cloudant/python-cloudant/issues/80)
+#TODO do unique keys so no conflict in concurrent run
 import unittest
-from justredis import Multiplexer, RedisError, RedisReplyError
+from justredis import Multiplexer, RedisError, RedisReplyError, utf8_bytes_as_strings
 from justredis.justredis import Connection
 from .redis_server import RedisServer, start_cluster
 import socket
@@ -95,10 +96,14 @@ class TestServerWithPassword(unittest.TestCase):
     def setUp(self):
         self.server = RedisServer(extraparams='--requirepass blah')
         self.mp = Multiplexer({'endpoints': ('localhost', self.server.port), 'password': 'blah'})
+        self.c0 = self.mp.database(0).command
+        self.cr0 = self.mp.database(0).commandreply
     
     def tearDown(self):
-        self.server = None
+        self.cr0 = None
+        self.c0 = None
         self.mp = None
+        self.server = None
 
     def test_wrongpassword(self):
         mp = Multiplexer({'endpoints': ('localhost', self.server.port), 'password': 'wrong'})
@@ -112,15 +117,35 @@ class TestServerWithPassword(unittest.TestCase):
 
     def test_simple(self):
         c = self.mp.database(0).command
+        cr = self.mp.database(0).commandreply
         cmd = c(b'SET', b'a', b'b')
         self.assertEqual(cmd(), b'OK')
         cmd = c(b'GET', b'a')
         self.assertEqual(cmd(), b'b')
+        reply = cr(b'GET', b'a')
+        self.assertEqual(reply, b'b')
 
 #    def test_notallowed(self):
 #        c = self.mp.database(0).command
 #        cmd = c(b'AUTH', b'asd')
 #        self.assertEqual(cmd(), b'OK')
+
+    def test_some_encodings(self):
+        cr = self.mp.database(0).commandreply
+        with self.assertRaises(ValueError):
+            cr(b'SET', 'a', True)
+        self.assertEqual(cr(b'INCRBYFLOAT', 'float_check', 0.1), b'0.1')
+        with self.assertRaises(ValueError):
+            cr(b'SET', 'a', [1, 2])
+        cr(b'SET', 'check_a', 'a')
+        cr(b'SET', 'check_b', 'b')
+        self.assertEqual(cr(b'GET', 'check_a', decoder=utf8_bytes_as_strings), 'a')
+        self.assertEqual(cr(b'MGET', 'check_a', 'check_b', decoder=utf8_bytes_as_strings), ['a', 'b'])
+
+    def test_chunk_encoded_command(self):
+        self.assertEqual(self.cr0(b'SET', b'test_chunk_encoded_command_a', b'test_chunk_encoded_command_a'*10*1024), b'OK')
+        self.assertEqual(self.cr0(b'GET', b'test_chunk_encoded_command_a'), b'test_chunk_encoded_command_a'*10*1024)
+        self.assertEqual(self.cr0(b'MGET', b'test_chunk_encoded_command_a'* 3500, b'test_chunk_encoded_command_a'* 3500, b'test_chunk_encoded_command_a'* 3500), [None, None, None])
 
     def test_multi(self):
         with self.mp.database(0).multi() as m:
@@ -170,6 +195,16 @@ class TestServerWithPassword(unittest.TestCase):
         with self.assertRaises(RedisReplyError):
             cmd()
 
+    def test_eval(self):
+        self.assertEqual(self.cr0('set', 'evaltest', b'a'), b'OK')
+        self.assertEqual(self.cr0('eval', "return redis.call('get','evaltest')", 0), b'a')
+        self.assertEqual(self.cr0('eval', "return redis.call('get','evaltestno')", 0), None)
+        self.assertEqual(self.cr0('eval', "return redis.call('get','evaltest')", 0), b'a')
+        self.assertEqual(self.cr0('eval', "return redis.call('get','evaltestno')", 0), None)
+        self.assertEqual(self.cr0('script', 'flush'), b'OK')
+        self.assertEqual(self.cr0('eval', "return redis.call('get','evaltest')", 0), b'a')
+        self.assertEqual(self.cr0('eval', "return redis.call('get','evaltestno')", 0), None)
+
 
 class TestCluster(unittest.TestCase):
     def setUp(self):
@@ -188,6 +223,36 @@ class TestCluster(unittest.TestCase):
         self.assertEqual(cmd(), b'OK')
         cmd = c(b'set', b'c', b'b')
         self.assertEqual(cmd(), b'OK')
+        cmd = c(b'set', b'{a}b', b'b')
+        self.assertEqual(cmd(), b'OK')
+        with self.assertRaises(RedisError):
+            self.mp.database(1).command(b'set', b'a', 'b')
+
+
+class TestPubSub(unittest.TestCase):
+    def setUp(self):
+        self.server = RedisServer()
+        self.mp = Multiplexer({'endpoints': ('localhost', self.server.port)})
+
+    def tearDown(self):
+        self.server = None
+        self.mp = None
+
+    def test_basic_pubsub(self):
+        pubsub = self.mp.pubsub()
+        cr = self.mp.database().commandreply
+        pubsub.add('hi', 'bye')
+        self.assertEqual(pubsub.message(), [b'subscribe', b'hi', 1])
+        self.assertEqual(pubsub.message(), [b'psubscribe', b'bye', 2])
+        self.assertEqual(pubsub.message(0.1), None)
+        cr(b'PUBLISH', 'hi', 'there')
+        self.assertEqual(pubsub.message(0.1), [b'message', b'hi', b'there'])
+        cr(b'PUBLISH', 'bye', 'there')
+        self.assertEqual(pubsub.message(0.1), [b'pmessage', b'bye', b'bye', b'there'])
+        pubsub.remove('hi')
+#        cr(b'PUBLISH', 'bye', 'there')
+#        self.assertEqual(pubsub.message(0.1), [b'pmessage', b'bye', b'bye', b'there'])
+#        self.assertEqual(pubsub.message(0.1), [b'pmessage', b'bye', b'bye', b'there'])
 
 
 if __name__ == '__main__':
