@@ -210,23 +210,38 @@ class TestCluster(unittest.TestCase):
     def setUp(self):
         self.servers = start_cluster(3)
         self.mp = Multiplexer({'endpoints': ('127.0.0.1', self.servers[0].port)})
+        self.c0 = self.mp.database().command
+        self.cr0 = self.mp.database().commandreply
 
     def tearDown(self):
+        self.cr0 = None
+        self.c0 = None
         self.mp = None
         self.servers = None
 
     def test_basic(self):
-        c = self.mp.database().command
-        cmd = c(b'set', b'a', b'b')
-        self.assertEqual(cmd(), b'OK')
-        cmd = c(b'set', b'b', b'b')
-        self.assertEqual(cmd(), b'OK')
-        cmd = c(b'set', b'c', b'b')
-        self.assertEqual(cmd(), b'OK')
-        cmd = c(b'set', b'{a}b', b'b')
-        self.assertEqual(cmd(), b'OK')
+        self.assertEqual(self.cr0(b'set', b'a', b'a'), b'OK')
+        self.assertEqual(self.cr0(b'set', b'b', b'b'), b'OK')
+        self.assertEqual(self.cr0(b'set', b'c', b'c'), b'OK')
+        self.assertEqual(self.cr0(b'set', b'{a}b', b'd'), b'OK')
         with self.assertRaises(RedisError):
             self.mp.database(1).command(b'set', b'a', 'b')
+
+    def test_outoforder(self):
+        c1 = self.c0(b'set', b'a', b'a')
+        c2 = self.c0(b'set', b'b', b'b')
+        c3 = self.c0(b'set', b'c', b'c')
+        c4 = self.c0(b'set', b'{a}b', b'ab')
+        with self.assertRaises(RedisError):
+            self.mp.database(1).command(b'set', b'a', 'b')
+        self.assertEqual(c1(), b'OK')
+        self.assertEqual(c2(), b'OK')
+        self.assertEqual(c3(), b'OK')
+        self.assertEqual(c4(), b'OK')
+
+    def test_misc(self):
+        # This tests an command which redis server says keys start in index 2.
+        self.cr0(b'object', b'help')
 
 
 class TestPubSub(unittest.TestCase):
@@ -235,8 +250,8 @@ class TestPubSub(unittest.TestCase):
         self.mp = Multiplexer({'endpoints': ('localhost', self.server.port)})
 
     def tearDown(self):
-        self.server = None
         self.mp = None
+        self.server = None
 
     def test_basic_pubsub(self):
         pubsub = self.mp.pubsub()

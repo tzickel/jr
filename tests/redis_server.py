@@ -1,14 +1,13 @@
 import subprocess
 import random
-import os
 
 
 def start_cluster(masters, dockerimage=None, extraparams='', ipv4=True):
     addr = '127.0.0.1' if ipv4 else '::1'
     ret = []
-    subprocess.call('rm /tmp/blah*.conf', shell=True)
+    subprocess.call('rm /tmp/justredis_cluster*.conf', shell=True)
     for x in range(masters):
-        ret.append(RedisServer(extraparams='--cluster-enabled yes --cluster-config-file /tmp/blah%d.conf' % x))
+        ret.append(RedisServer(extraparams='--cluster-enabled yes --cluster-config-file /tmp/justredis_cluster%d.conf' % x))
     subprocess.Popen('redis-cli --cluster create ' + ' '.join(['%s:%d' % (addr, server.port) for server in ret]), stdin=subprocess.PIPE, shell=True).communicate(b'yes\n')
     return ret
 
@@ -22,7 +21,6 @@ class RedisServer(object):
                 cmd = 'docker run --rm -p {port}:6379 {image} --save {extraparams}'.format(port=self.port, image=dockerimage, extraparams=extraparams)
             else:
                 cmd = 'redis-server --save --port {port} {extraparams}'.format(port=self.port, extraparams=extraparams)
-#            print(cmd)
             self._proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             seen_redis = False
             while True:
@@ -55,12 +53,3 @@ class RedisServer(object):
             except Exception:
                 pass
             self._proc = None
-
-
-if __name__ == "__main__":
-    from redis import Redis
-
-    rs = RedisServer(dockerimage='redis:4.0')
-    r = Redis(port=rs.port)
-    print(r.set('a', 'a'))
-    print(r.get('a'))

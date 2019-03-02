@@ -660,8 +660,10 @@ class Multiplexer(object):
             self._command_cache[command_name] = keyindex
         if keyindex == 0:
             return None
-        # TODO (error) if keyindex does not exist, should we ignore it ?
-        key = cmd.get_index_as_bytes(keyindex)
+        try:
+            key = cmd.get_index_as_bytes(keyindex)
+        except IndexError:
+            return None
         return calc_hash(key)
 
 
