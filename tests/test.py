@@ -242,6 +242,12 @@ class TestCluster(unittest.TestCase):
     def test_misc(self):
         # This tests an command which redis server says keys start in index 2.
         self.cr0(b'object', b'help')
+        # Check command with no keys
+        self.cr0(b'client', b'list')
+
+    def test_server(self):
+        for endpoint in self.mp.endpoints():
+            print(self.mp.database(server=endpoint).commandreply(b'keys', b'*', throw=False))
 
 
 class TestPubSub(unittest.TestCase):
@@ -264,10 +270,11 @@ class TestPubSub(unittest.TestCase):
         self.assertEqual(pubsub.message(0.1), [b'message', b'hi', b'there'])
         cr(b'PUBLISH', 'bye', 'there')
         self.assertEqual(pubsub.message(0.1), [b'pmessage', b'bye', b'bye', b'there'])
+        pubsub.ping()
+        self.assertEqual(pubsub.message(), [b'pong', b''])
+        pubsub.ping('hi')
+        self.assertEqual(pubsub.message(0.1), [b'pong', b'hi'])
         pubsub.remove('hi')
-#        cr(b'PUBLISH', 'bye', 'there')
-#        self.assertEqual(pubsub.message(0.1), [b'pmessage', b'bye', b'bye', b'there'])
-#        self.assertEqual(pubsub.message(0.1), [b'pmessage', b'bye', b'bye', b'there'])
 
 
 if __name__ == '__main__':

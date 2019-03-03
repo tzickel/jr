@@ -1,29 +1,28 @@
 # What?
-An asynchronous redis client library for Python 2.7 and 3.5+
+An asynchronous redis client library for Python 2.7 and 3.5.3+  
 
 # Why?
 * All commands are pipelined (asynchronous)
 * No connection pool, a single connection per redis instance even between different execution contexts (extra one if using pub/sub)
+* Supports several execution contexts: cooperative multitasking, preemptive multithreading, gevent and pluggable support for others
 * Optional per command encoding / decoding / retries
-* Supports several execution contexts: cooperative multitasking, normal multithreading, gevent and pluggable support for others
 
 # Also supports
+* Redis Cluster
 * Pub/Sub
 * Transparent script caching
 * Retry support only when it's safe
 * Hiredis parser
-* Testing with private redis server
+* Testing with private redis server and cluster
 
 # Inherit Limitations
 * Cannot issue blocking commands (such as BLPOP)
 * Cannot issue transaction commands with WATCH (but MULTI and EXEC can be used)
 
 # Roadmap
-- [ ] Cluster support
-- [ ] async/await support
-- [ ] Support for non cooperative result parsing
 - [ ] API Finalization
-- [ ] Resp V3 ?
+- [ ] Finish little holes in currently supported commands
+- [ ] Network I/O failure tests
 
 # Example
 This example uses an asynchronous syntax which is compatible with Python 2.7. You can call () on a redis command to resolve it's reply (or not if you don't care about the result).

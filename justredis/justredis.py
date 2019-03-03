@@ -268,6 +268,8 @@ class Connection(object):
                     raise RedisError('Connection failed: %r' % e)
         # needed for cluster support
         self.name = self.socket.getpeername()
+        if self.socket.family == socket.AF_INET6:
+            self.name = self.name[:2]
         if isinstance(self.socket.getsockname(), tuple):
             if tcpnodelay:
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -515,17 +517,26 @@ class Multiplexer(object):
     def __del__(self):
         self.close()
 
-    def database(self, number=0, encoder=None, decoder=None, retries=3):
-        if number != 0 and self._clustered:
+    def database(self, number=0, encoder=None, decoder=None, retries=3, server=None):
+        if number != 0 and self._clustered and server is None:
             raise RedisError('Redis cluster has no database selection support')
-        return Database(self, number, encoder, decoder, retries)
+        return Database(self, number, encoder, decoder, retries, server)
 
-    def pubsub(self):
+    # TODO support optional server instance for pub/sub ?
+    def pubsub(self, encoder=None, decoder=None):
         if self._pubsub is None:
             with self._lock:
                 if self._pubsub is None:
                     self._pubsub = PubSub(self)
-        return PubSubInstance(self._pubsub)
+        return PubSubInstance(self._pubsub, encoder, decoder)
+
+    def endpoints(self):
+        if self._clustered is None:
+            self._get_connection()
+        if self._clustered:
+            return [x[1] for x in self._slots]
+        else:
+            return list(self._connections.keys())
 
     def _get_connection(self, hashslot=None):
         if not hashslot:
@@ -575,19 +586,34 @@ class Multiplexer(object):
                 return conn
             # TODO (misc) should we try getting another connection here ?
             except Exception:
-                self.update_slots()
+                self._update_slots()
                 raise
 
-    # TODO TRY MULTICOMMAND AS FIRST ONE?
-    def _send_command(self, cmd):
-        if isinstance(cmd, MultiCommand) and self._clustered is not False:
-            for acmd in cmd._cmds[1:-1]:
-                hashslot = self._get_command_from_cache(acmd)
-                if hashslot is not None:
-                    break
+    def _send_command(self, cmd, server=None):
+        if not server:
+            if isinstance(cmd, MultiCommand) and self._clustered is not False:
+                for acmd in cmd._cmds[1:-1]:
+                    hashslot = self._get_command_from_cache(acmd)
+                    if hashslot is not None:
+                        break
+            else:
+                hashslot = self._get_command_from_cache(cmd)
+            connection = self._get_connection(hashslot)
         else:
-            hashslot = self._get_command_from_cache(cmd)
-        connection = self._get_connection(hashslot)
+            try:
+                conn = self._connections.get(server)
+                if not conn or conn.closed:
+                    #TODO lock per conn
+                    with self._lock:
+                        conn = self._connections.get(server)
+                        if not conn or conn.closed:
+                            conn = Connection.create(server, self._configuration)
+                            self._connections[server] = conn
+                connection = conn
+            # TODO (misc) should we try getting another connection here ?
+            except Exception:
+                self._update_slots()
+                raise
         connection.send(cmd)
 
     def _update_slots(self, moved_hint=None, with_connection=None):
@@ -668,26 +694,27 @@ class Multiplexer(object):
 
 
 class Database(object):
-    __slots__ = '_multiplexer', '_number', '_encoder', '_decoder', '_retries', '_scripts', '_scripts_sha'
+    __slots__ = '_multiplexer', '_number', '_encoder', '_decoder', '_retries', '_scripts', '_scripts_sha', '_server'
 
-    def __init__(self, multiplexer, number, encoder, decoder, retries):
+    def __init__(self, multiplexer, number, encoder, decoder, retries, server):
         self._multiplexer = multiplexer
         self._number = number
         self._encoder = encoder
         self._decoder = decoder
         self._retries = retries
+        self._server = server
         self._scripts = multiplexer._scripts
         self._scripts_sha = multiplexer._scripts_sha
 
     def command(self, *args, **kwargs):
         cmd = parse_command(self, *args, **kwargs)
-        self._multiplexer._send_command(cmd)
+        self._multiplexer._send_command(cmd, self._server)
         return cmd
 
     def commandreply(self, *args, **kwargs):
-        cmd = self.command(*args, **kwargs)
-        return cmd()
+        return self.command(*args, **kwargs)()
 
+    # TODO ADD SERVER SUPPORT !!!
     def multi(self, retries=None):
         return MultiCommand(self, retries if retries is not None else self._retries)
 
@@ -875,6 +902,11 @@ class PubSub(object):
                                 _instance._add_message(res)
                                 if instance == _instance:
                                     stop = True
+                    elif res[0] == b'pong':
+                        with self._lock:
+                            for _instance in self._registered_instances.keys():
+                                _instance._add_message(res)
+                            stop = True
                 if stop:
                     break
             finally:
@@ -885,6 +917,13 @@ class PubSub(object):
     def loop(self):
         while True:
             self.message(None)
+
+    # TODO should we deliver ping to everyone, or the instance who requested only ?
+    def ping(self, message=None):
+        if message:
+            self._command(b'PING', message)
+        else:
+            self._command(b'PING')
 
     # If in register / unregister there is an I/O at least it's bookkeeped first so later invocations will fix it
     def register(self, instance, channels=None, patterns=None):
@@ -930,11 +969,14 @@ class PubSub(object):
                 self._command(b'PUNSUBSCRIBE', *patterns_to_remove)
 
 
+# Don't pass this between different invocation contexts
 class PubSubInstance(object):
-    __slots__ = '_pubsub', '_closed', '_messages'
+    __slots__ = '_pubsub', '_encoder', '_decoder', '_closed', '_messages_'
 
-    def __init__(self, pubsub):
+    def __init__(self, pubsub, encoder, decoder):
         self._pubsub = pubsub
+        self._encoder = encoder or utf8_encode
+        self._decoder = decoder
         self._closed = False
         self._messages = deque()
 
@@ -948,7 +990,34 @@ class PubSubInstance(object):
                 self._pubsub.unregister(self)
             except Exception:
                 pass
+            self._messages = None
+            self._decoder = None
+            self._encoder = None
             self._pubsub = None
+
+    def add(self, channels=None, patterns=None):
+        self._cmd(self._pubsub.register, channels, patterns)
+
+    # TODO (question) should we removed the self._messages that are related to this channels and patterns ?
+    def remove(self, channels=None, patterns=None):
+        self._cmd(self._pubsub.unregister, channels, patterns)
+
+    def message(self, max_timeout=None):
+        if self._closed:
+            raise RedisError('Pub/sub instance closed')
+        try:
+            return self._messages.popleft() if not self._decoder else self._decoder(self._messages.popleft())
+        except IndexError:
+            self._pubsub.message(self, max_timeout)
+            try:
+                return self._messages.popleft() if not self._decoder else self._decoder(self._messages.popleft())
+            except IndexError:
+                return None
+
+    def ping(self, message=None):
+        if self._closed:
+            raise RedisError('Pub/sub instance closed')
+        self._pubsub.ping(message)
 
     def _cmd(self, cmd, channels, patterns):
         if self._closed:
@@ -956,31 +1025,12 @@ class PubSubInstance(object):
         if channels:
             if isinstance(channels, (unicode, str, bytes)):
                 channels = [channels]
-            channels = [utf8_encode(x) for x in channels]
+            channels = [self._encoder(x) for x in channels]
         if patterns:
             if isinstance(patterns, (unicode, str, bytes)):
                 patterns = [patterns]
-            patterns = [utf8_encode(x) for x in patterns]
+            patterns = [self._encoder(x) for x in patterns]
         cmd(self, channels, patterns)
-
-    def add(self, channels=None, patterns=None):
-        self._cmd(self._pubsub.register, channels, patterns)
-
-    def remove(self, channels=None, patterns=None):
-        self._cmd(self._pubsub.unregister, channels, patterns)
 
     def _add_message(self, msg):
         self._messages.append(msg)
-
-    # Don't pass this between different invocation contexts
-    def message(self, max_timeout=None):
-        if self._closed:
-            raise RedisError('Pub/sub instance closed')
-        try:
-            return self._messages.popleft()
-        except IndexError:
-            self._pubsub.message(self, max_timeout)
-            try:
-                return self._messages.popleft()
-            except IndexError:
-                return None
