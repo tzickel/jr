@@ -49,6 +49,9 @@ except NameError:
     connect_errors = (socket.error, socket.timeout)
 
 
+socket_errors = (IOError, OSError, socket.error, socket.timeout)
+
+
 # TODO refine this....
 command_retry_errors = (Exception)
 
@@ -170,7 +173,7 @@ def calc_hash(key):
     try:
         s = key.index(b'{')
         e = key.index(b'}')
-        if e > s:
+        if e > s + 1:
             key = key[s + 1:e]
     except ValueError:
         pass
@@ -361,8 +364,11 @@ class Connection(object):
                     self.commands.append(cmd)
                 if self.thread_event:
                     self.thread_event.set()
-        except Exception as e:
+        # We should only mark the socket for closing when it's dead
+        except socket_errors as e:
             self.close_write()
+            cmd.set_result(e)
+        except Exception as e:
             cmd.set_result(e)
 
     def resolve(self):
@@ -503,15 +509,14 @@ class Multiplexer(object):
         self._slots = []
 
     def close(self):
-        if self._connections:
-            with self._lock:
-                try:
-                    for connection in self._connections.values():
-                        connection.close()
-                except Exception:
-                    pass
-                self._connections = {}
-                self._last_connection = None
+        with self._lock:
+            try:
+                for connection in self._connections.values():
+                    connection.close()
+            except Exception:
+                pass
+            self._connections = {}
+            self._last_connection = None
 
     # TODO (misc) is this sane or we should not support this (explicitly call close?)
     def __del__(self):
@@ -537,6 +542,14 @@ class Multiplexer(object):
             return [x[1] for x in self._slots]
         else:
             return list(self._connections.keys())
+
+    def run_commandreply_on_all_masters(self, *args, **kwargs):
+        if self._clustered is False:
+            raise RedisError('This command only runs on cluster mode')
+        res = {}
+        for endpoint in self.endpoints():
+            res[endpoint] = self.database(server=endpoint).commandreply(*args, **kwargs)
+        return res
 
     def _get_connection(self, hashslot=None):
         if not hashslot:
@@ -918,7 +931,7 @@ class PubSub(object):
         while True:
             self.message(None)
 
-    # TODO should we deliver ping to everyone, or the instance who requested only ?
+    # TODO (question) should we deliver ping to everyone, or the instance who requested only ?
     def ping(self, message=None):
         if message:
             self._command(b'PING', message)
@@ -971,7 +984,7 @@ class PubSub(object):
 
 # Don't pass this between different invocation contexts
 class PubSubInstance(object):
-    __slots__ = '_pubsub', '_encoder', '_decoder', '_closed', '_messages_'
+    __slots__ = '_pubsub', '_encoder', '_decoder', '_closed', '_messages'
 
     def __init__(self, pubsub, encoder, decoder):
         self._pubsub = pubsub

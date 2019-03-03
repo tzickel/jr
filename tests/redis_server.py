@@ -8,6 +8,7 @@ def start_cluster(masters, dockerimage=None, extraparams='', ipv4=True):
     subprocess.call('rm /tmp/justredis_cluster*.conf', shell=True)
     for x in range(masters):
         ret.append(RedisServer(extraparams='--cluster-enabled yes --cluster-config-file /tmp/justredis_cluster%d.conf' % x))
+    # Requires redis-cli from version 5 for cluster management support
     subprocess.Popen('redis-cli --cluster create ' + ' '.join(['%s:%d' % (addr, server.port) for server in ret]), stdin=subprocess.PIPE, shell=True).communicate(b'yes\n')
     return ret
 

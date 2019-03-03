@@ -24,6 +24,15 @@ An asynchronous redis client library for Python 2.7 and 3.5.3+
 - [ ] Finish little holes in currently supported commands
 - [ ] Network I/O failure tests
 
+# Installing
+For now you can install this via this github repository by pip installing or adding to your requirements.txt file:
+
+```
+https://github.com/tzickel/jr/archive/master.zip
+```
+
+Replace master with the specific branch or version tag you want.
+
 # Example
 This example uses an asynchronous syntax which is compatible with Python 2.7. You can call () on a redis command to resolve it's reply (or not if you don't care about the result).
 

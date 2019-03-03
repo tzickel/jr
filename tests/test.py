@@ -212,6 +212,14 @@ class TestCluster(unittest.TestCase):
         self.mp = Multiplexer({'endpoints': ('127.0.0.1', self.servers[0].port)})
         self.c0 = self.mp.database().command
         self.cr0 = self.mp.database().commandreply
+        # Sometimes it takes awhile for the cluster to be ready
+        wait = 50
+        while wait:
+            if b'cluster_state:ok' in self.cr0(b'CLUSTER', b'INFO'):
+                break
+            wait -= 1
+        if not wait:
+            raise Exception('Cluster is down, could not run test')
 
     def tearDown(self):
         self.cr0 = None
@@ -246,8 +254,14 @@ class TestCluster(unittest.TestCase):
         self.cr0(b'client', b'list')
 
     def test_server(self):
-        for endpoint in self.mp.endpoints():
-            print(self.mp.database(server=endpoint).commandreply(b'keys', b'*', throw=False))
+        self.assertEqual(self.cr0(b'set', b'aa', b'a'), b'OK')
+        self.assertEqual(self.cr0(b'set', b'bb', b'b'), b'OK')
+        self.assertEqual(self.cr0(b'set', b'cc', b'c'), b'OK')
+        result = self.mp.run_commandreply_on_all_masters(b'KEYS', b'*')
+        self.assertEqual(len(result), 3)
+        result = list(result.values())
+        result = [i for s in result for i in s]
+        self.assertEqual(set(result), set([b'aa', b'bb', b'cc']))
 
 
 class TestPubSub(unittest.TestCase):
