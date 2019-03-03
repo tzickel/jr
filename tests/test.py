@@ -276,11 +276,17 @@ class TestPubSub(unittest.TestCase):
     def test_basic_pubsub(self):
         pubsub = self.mp.pubsub()
         cr = self.mp.database().commandreply
+        print(2)
         pubsub.add('hi', 'bye')
+        print(2)
         self.assertEqual(pubsub.message(), [b'subscribe', b'hi', 1])
+        print(2)
         self.assertEqual(pubsub.message(), [b'psubscribe', b'bye', 2])
+        print(2)
         self.assertEqual(pubsub.message(0.1), None)
+        print(2)
         cr(b'PUBLISH', 'hi', 'there')
+        print(2)
         self.assertEqual(pubsub.message(0.1), [b'message', b'hi', b'there'])
         cr(b'PUBLISH', 'bye', 'there')
         self.assertEqual(pubsub.message(0.1), [b'pmessage', b'bye', b'bye', b'there'])

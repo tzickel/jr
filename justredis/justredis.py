@@ -538,8 +538,9 @@ class Multiplexer(object):
     def endpoints(self):
         if self._clustered is None:
             self._get_connection()
+        # TODO is this atomic ?
         if self._clustered:
-            return [x[1] for x in self._slots]
+            return [x[1] for x in list(self._slots)]
         else:
             return list(self._connections.keys())
 
@@ -823,19 +824,12 @@ class MultiCommand(object):
         return cmd
 
 
-# TODO how to handle retries on I/O errors ?
-# TODO the multiplexer .close should close this as well
-# TODO encoding?
-# TODO should I have a registration object ? (per object lifetime)
-# This is a global instance per multiplexer
-# TODO auto close by looking at the reply number of subs ?
-# TODO ping ? just use keepalive ?
-# TODO decoding / encoding per instance !
-# TODO keys must be binaries, what does hiredis do ?
 
-# TODO deadlock because waiting on message, and add/ing removing instances same lock !
+# TODO the multiplexer .close should close this as well ?
+# TODO document the error model possible here and implications
+# TODO auto close by looking at the reply number of subs ?
 class PubSub(object):
-#    __slots__ = '_multiplexer', '_connection', '_lock', '_msg_lock', '_msg_waiting', '_registered_instances', '_registered_channels', '_registered_patterns', '_thread'
+    __slots__ = '_multiplexer', '_connection', '_lock', '_msg_lock', '_msg_waiting', '_registered_instances', '_registered_channels', '_registered_patterns', '_thread'
 
     def __init__(self, multiplexer):
         self._multiplexer = multiplexer
@@ -846,12 +840,20 @@ class PubSub(object):
         self._registered_instances = {}
         self._registered_channels = {}
         self._registered_patterns = {}
-        if thread:
-            self._thread = thread(self.loop)
 
     def create_connection(self):
         if self._connection is None or self._connection.closed:
-            self._connection = Connection.create(self._multiplexer._endpoints[0], self._multiplexer._configuration)
+            # TODO thread safety with _get_connection from multiplexer?
+            for endpoint in self._multiplexer.endpoints():
+                try:
+                    self._connection = Connection.create(endpoint, self._multiplexer._configuration)
+                    if thread:
+                        self._thread = thread(self.loop)
+                    break
+                except Exception:
+                    pass
+            else:
+                raise RedisError('No server found')
             return True
         return False
 
@@ -871,6 +873,7 @@ class PubSub(object):
             cmd = Command((cmd, ) + args, enqueue=False, retries=0)
             self._connection.send(cmd)
             ret = False
+        print(self._registered_channels, self._registered_patterns)
         if not self._registered_channels and not self._registered_patterns:
             self._connection.close()
         return ret
@@ -928,15 +931,20 @@ class PubSub(object):
         self._msg_waiting.set()
 
     def loop(self):
+        conn = self._connection
         while True:
+            # Drop out for a new thread if there was an I/O error
+            if self._connection != conn:
+                return
             self.message(None)
 
     # TODO (question) should we deliver ping to everyone, or the instance who requested only ?
     def ping(self, message=None):
-        if message:
-            self._command(b'PING', message)
-        else:
-            self._command(b'PING')
+        with self._lock:
+            if message:
+                self._command(b'PING', message)
+            else:
+                self._command(b'PING')
 
     # If in register / unregister there is an I/O at least it's bookkeeped first so later invocations will fix it
     def register(self, instance, channels=None, patterns=None):
@@ -961,23 +969,31 @@ class PubSub(object):
         with self._lock:
             channels_to_remove = []
             patterns_to_remove = []
-            registered_channels, registered_patterns = self._registered_instances.pop(instance)
+            registered_channels, registered_patterns = self._registered_instances[instance]
             for channel in registered_channels:
                 if channels and channel not in channels:
                     continue
-                registered_channel = self._registered_channels[channel]
+                registered_channel = self._registered_channels.get(channel)
+                if registered_channel is None:
+                    continue
                 registered_channel.discard(instance)
                 if not registered_channel:
                     channels_to_remove.append(channel)
             for pattern in registered_patterns:
                 if patterns and pattern not in patterns:
                     continue
-                registered_pattern = self._registered_patterns[pattern]
+                registered_pattern = self._registered_patterns.get(pattern)
+                if registered_pattern is None:
+                    continue
                 registered_pattern.discard(instance)
                 if not registered_pattern:
                     patterns_to_remove.append(pattern)
+            if not registered_channels and not registered_patterns:
+                del self._registered_instances[instance]
             if channels_to_remove:
-                self._command(b'UNSUBSCRIBE', *channels_to_remove)
+                # If this was a new connection, no need to unregister patterns
+                if self._command(b'UNSUBSCRIBE', *channels_to_remove):
+                    return
             if patterns_to_remove:
                 self._command(b'PUNSUBSCRIBE', *patterns_to_remove)
 
