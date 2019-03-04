@@ -134,4 +134,4 @@ You can also manually set the execution environment by the os environment variab
 * builtin_with_threads - preemptive multithreading
 
 # Partly inspired by
-The .NET Redis client package [ServiceStack.Redis]](https://stackexchange.github.io/StackExchange.Redis/)
+The .NET Redis client package [ServiceStack.Redis](https://stackexchange.github.io/StackExchange.Redis/)
