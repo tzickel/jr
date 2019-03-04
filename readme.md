@@ -91,7 +91,7 @@ if __name__ == '__main__':
 ```
 
 # API
-This is all the Python 2.7 API in a nutshell:
+This is all the Python 2.7 compatible API in a nutshell:
 
 ```python
 Multiplexer(configuration=None)
@@ -112,7 +112,7 @@ Multiplexer(configuration=None)
     message(max_timeout=None)
     ping(message=None)
   endpoints()
-  run_commandreply_on_all_masters(*args, encoder=utf8_encode, decoder=None, retries=3, server=None)
+  run_commandreply_on_all_masters(*args, encoder=utf8_encode, decoder=None, retries=3)
   close()
 ```
 

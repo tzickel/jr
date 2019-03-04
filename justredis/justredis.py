@@ -879,59 +879,47 @@ class PubSub(object):
         if not self._registered_channels and not self._registered_patterns:
             self._connection.close()
         return ret
-    
+
     # TODO handle i/o error (reconnect / resubscribe with main lock, at start)
     # TODO should we handle the possibility that someone called message with nothing registered ?
     def message(self, instance, max_timeout=None):
-        stop = False if max_timeout is None else True
-        while max_timeout is None or stop:
-            try:
-                got_lock = self._msg_lock.acquire(False)
-                if not got_lock:
-                    return self._msg_waiting.wait(max_timeout)
-                res = self._connection.recv(allow_empty=True)
-                if res is False:
-                    if self._connection.wait(max_timeout):
-                        res = self._connection.recv()
-                    else:
-                        res = None
-                if res:
-                    # The reason we send subscribe messages as well, is to know when an I/O reconnection has occurred
-                    if res[0] == b'message':
-                        with self._lock:
-                            for _instance in self._registered_channels[res[1]]:
-                                _instance._add_message(res)
-                                if instance == _instance:
-                                    stop = True
-                    elif res[0] == b'pmessage':
-                        with self._lock:
-                            for _instance in self._registered_patterns[res[1]]:
-                                _instance._add_message(res)
-                                if instance == _instance:
-                                    stop = True
-                    elif res[0] == b'subscribe':
-                        with self._lock:
-                            for _instance in self._registered_channels[res[1]]:
-                                _instance._add_message(res)
-                                if instance == _instance:
-                                    stop = True
-                    elif res[0] == b'psubscribe':
-                        with self._lock:
-                            for _instance in self._registered_patterns[res[1]]:
-                                _instance._add_message(res)
-                                if instance == _instance:
-                                    stop = True
-                    elif res[0] == b'pong':
-                        with self._lock:
-                            for _instance in self._registered_instances.keys():
-                                _instance._add_message(res)
-                            stop = True
-                if stop:
-                    break
-            finally:
-                if got_lock:
-                    self._msg_lock.release()
-        self._msg_waiting.set()
+        try:
+            got_lock = self._msg_lock.acquire(False if instance is not None else True)
+            if not got_lock:
+                return self._msg_waiting.wait(max_timeout)
+            self._msg_waiting.clear()
+            res = self._connection.recv(allow_empty=True)
+            if res is False:
+                if self._connection.wait(max_timeout):
+                    res = self._connection.recv()
+                else:
+                    res = None
+            if res:
+                self._msg_waiting.set()
+                # The reason we send subscribe messages as well, is to know when an I/O reconnection has occurred
+                if res[0] == b'message':
+                    with self._lock:
+                        for _instance in self._registered_channels[res[1]]:
+                            _instance._add_message(res)
+                elif res[0] == b'pmessage':
+                    with self._lock:
+                        for _instance in self._registered_patterns[res[1]]:
+                            _instance._add_message(res)
+                elif res[0] == b'subscribe':
+                    with self._lock:
+                        for _instance in self._registered_channels[res[1]]:
+                            _instance._add_message(res)
+                elif res[0] == b'psubscribe':
+                    with self._lock:
+                        for _instance in self._registered_patterns[res[1]]:
+                            _instance._add_message(res)
+                elif res[0] == b'pong':
+                    with self._lock:
+                        for _instance in self._registered_instances.keys():
+                            _instance._add_message(res)
+        finally:
+            if got_lock:
+                self._msg_lock.release()
 
     def loop(self):
         conn = self._connection
