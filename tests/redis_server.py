@@ -15,8 +15,9 @@ def start_cluster(masters, dockerimage=None, extraparams='', ipv4=True):
 
 class RedisServer(object):
     def __init__(self, dockerimage=None, extraparams=''):
+        self._proc = None
         while True:
-            self._proc = None
+            self.close()
             self._port = random.randint(1025, 65535)
             if dockerimage:
                 cmd = 'docker run --rm -p {port}:6379 {image} --save {extraparams}'.format(port=self.port, image=dockerimage, extraparams=extraparams)
@@ -45,7 +46,7 @@ class RedisServer(object):
     def port(self):
         return self._port
 
-    def __del__(self):
+    def close(self):
         if self._proc:
             try:
                 self._proc.stdout.close()
@@ -54,3 +55,6 @@ class RedisServer(object):
             except Exception:
                 pass
             self._proc = None
+
+    def __del__(self):
+        self.close()
