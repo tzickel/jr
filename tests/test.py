@@ -283,6 +283,7 @@ class TestPubSub(unittest.TestCase):
         print(2)
         self.assertEqual(pubsub.message(), [b'psubscribe', b'bye', 2])
         print(2)
+        #import pdb; pdb.set_trace()
         self.assertEqual(pubsub.message(0.1), None)
         print(2)
         cr(b'PUBLISH', 'hi', 'there')
@@ -295,7 +296,6 @@ class TestPubSub(unittest.TestCase):
         pubsub.ping('hi')
         self.assertEqual(pubsub.message(0.1), [b'pong', b'hi'])
         pubsub.remove('hi')
-
 
 if __name__ == '__main__':
     unittest.main()

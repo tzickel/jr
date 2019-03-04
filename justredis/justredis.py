@@ -49,6 +49,7 @@ except NameError:
     connect_errors = (socket.error, socket.timeout)
 
 
+# TODO (question) Am I missing an exception type here ?
 socket_errors = (IOError, OSError, socket.error, socket.timeout)
 
 
@@ -101,7 +102,6 @@ def bytes_as_strings(encoding='utf-8', errors='strict'):
 utf8_bytes_as_strings = bytes_as_strings()
 
 # Redis protocol encoder / decoder
-# TODO (misc) this can be a generator
 def encode_command(data, encoder):
     output = [b'*', encode_number(len(data)), b'\r\n']
     for arg in data:
@@ -217,6 +217,7 @@ def parse_command(source, *args, **kwargs):
     decoder = source._decoder
     throw = True
     retries = source._retries
+    server = source._server
     if kwargs:
         encoder = kwargs.get('encoder', encoder)
         decoder = kwargs.get('decoder', decoder)
@@ -234,7 +235,7 @@ def parse_command(source, *args, **kwargs):
             sha = sha1(bscript).hexdigest()
             source._scripts[script] = sha
             source._scripts_sha[sha] = script
-    return Command(args, source, encoder, decoder, throw, retries)
+    return Command(args, source, encoder, decoder, throw, retries, True, server)
 
 
 class Connection(object):
@@ -295,7 +296,6 @@ class Connection(object):
         self.parser = hiredis_parser()
         self.parser.send(None)
         self.lastdatabase = 0
-        self.select = select
         self.thread_event = None
         if thread:
             self.thread_event = Event()
@@ -405,16 +405,16 @@ class Connection(object):
 
     def wait(self, timeout):
         # I am hoping here that select on all platforms returns a read error on closing
-        res = self.select([self.socket], [], [], timeout)
+        res = select([self.socket], [], [], timeout)
         if not res[0]:
             return False
         return True
 
 
 class Command(object):
-    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue'
+    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue', '_server'
 
-    def __init__(self, data, database=None, encoder=None, decoder=None, throw=True, retries=3, enqueue=True):
+    def __init__(self, data, database=None, encoder=None, decoder=None, throw=True, retries=3, enqueue=True, server=None):
         self._data = data
         self._database = database
         self._encoder = encoder or utf8_encode
@@ -422,6 +422,7 @@ class Command(object):
         self._throw = throw
         self._retries = retries
         self._enqueue = enqueue
+        self._server = server
         self._resolver = None
         self._got_result = False
         self._result = None
@@ -571,14 +572,15 @@ class Multiplexer(object):
                                     if self._clustered is None:
                                         self._update_slots(with_connection=conn)
                                     return conn
-                            except Exception:
+                            except Exception as e:
+                                exp = e
                                 try:
                                     conn.close()
                                 except:
                                     pass
                                 self._connections.pop(addr, None)
                         self._last_connection = None
-                        raise RedisError('Could not find any connection')
+                        raise exp
             return self._last_connection
         else:
             if not self._slots:
@@ -603,7 +605,8 @@ class Multiplexer(object):
                 self._update_slots()
                 raise
 
-    def _send_command(self, cmd, server=None):
+    def _send_command(self, cmd):
+        server = cmd._server
         if not server:
             if isinstance(cmd, MultiCommand) and self._clustered is not False:
                 for acmd in cmd._cmds[1:-1]:
@@ -722,26 +725,27 @@ class Database(object):
 
     def command(self, *args, **kwargs):
         cmd = parse_command(self, *args, **kwargs)
-        self._multiplexer._send_command(cmd, self._server)
+        self._multiplexer._send_command(cmd)
         return cmd
 
     def commandreply(self, *args, **kwargs):
         return self.command(*args, **kwargs)()
 
-    # TODO ADD SERVER SUPPORT !!!
     def multi(self, retries=None):
-        return MultiCommand(self, retries if retries is not None else self._retries)
+        return MultiCommand(self, retries if retries is not None else self._retries, server=self._server)
 
 
+# TODO maybe split the user facing API from the internal Command one (atleast mark it as _)
 # To know the result of a multi command simply resolve any command inside
 class MultiCommand(object):
-    __slots__ = '_database', '_cmds', '_done', '_retries', '_enqueue'
+    __slots__ = '_database', '_retries', '_server', '_cmds', '_done', '_enqueue'
 
-    def __init__(self, database, retries):
+    def __init__(self, database, retries, server):
         self._database = database
+        self._retries = retries
+        self._server = server
         self._cmds = []
         self._done = False
-        self._retries = retries
         self._enqueue = True
 
     def stream(self, chunk_size):
@@ -755,7 +759,7 @@ class MultiCommand(object):
         return self._database._number
 
     def set_result(self, result, dont_retry=False):
-        # TODO (misc) If there is an exec error, maybe preserve the original per-cmd error as well ?
+        # TODO (question) If there is an exec error, maybe preserve the original per-cmd error as well ?
         if isinstance(result, list):
             exec_res = result[-1]
             if isinstance(exec_res, list):
@@ -824,10 +828,9 @@ class MultiCommand(object):
         return cmd
 
 
-
 # TODO the multiplexer .close should close this as well ?
 # TODO document the error model possible here and implications
-# TODO auto close by looking at the reply number of subs ?
+# TODO auto close by looking at the reply number of subs ? (nop)
 class PubSub(object):
     __slots__ = '_multiplexer', '_connection', '_lock', '_msg_lock', '_msg_waiting', '_registered_instances', '_registered_channels', '_registered_patterns', '_thread'
 
@@ -850,10 +853,10 @@ class PubSub(object):
                     if thread:
                         self._thread = thread(self.loop)
                     break
-                except Exception:
-                    pass
+                except Exception as e:
+                    exc = e
             else:
-                raise RedisError('No server found')
+                raise exc
             return True
         return False
 
@@ -873,12 +876,12 @@ class PubSub(object):
             cmd = Command((cmd, ) + args, enqueue=False, retries=0)
             self._connection.send(cmd)
             ret = False
-        print(self._registered_channels, self._registered_patterns)
         if not self._registered_channels and not self._registered_patterns:
             self._connection.close()
         return ret
     
     # TODO handle i/o error (reconnect / resubscribe with main lock, at start)
+    # TODO should we handle the possibility that someone called message with nothing registered ?
     def message(self, instance, max_timeout=None):
         stop = False if max_timeout is None else True
         while max_timeout is None or stop:
@@ -950,12 +953,12 @@ class PubSub(object):
     def register(self, instance, channels=None, patterns=None):
         with self._lock:
             registered = self._registered_instances.setdefault(instance, [set(), set()])
-            registered[0].update(channels)
-            registered[1].update(patterns)
             if channels:
+                registered[0].update(channels)
                 for channel in channels:
                     self._registered_channels.setdefault(channel, set()).add(instance)
             if patterns:
+                registered[1].update(patterns)
                 for pattern in patterns:
                     self._registered_patterns.setdefault(pattern, set()).add(instance)
             if channels:

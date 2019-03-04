@@ -1,5 +1,5 @@
 # What?
-An asynchronous redis client library for Python 2.7 and 3.5.3+  
+An asynchronous redis client library for Python 2.7 and 3
 
 # Why?
 * All commands are pipelined (asynchronous)
