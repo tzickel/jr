@@ -518,7 +518,7 @@ class Command(object):
 
 
 class Multiplexer(object):
-#    __slots__ = '_endpoints', '_configuration', '_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache'
+    __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_tryindex', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots'
 
     def __init__(self, configuration=None):
         self._endpoints, self._configuration = parse_uri(configuration)
@@ -545,7 +545,7 @@ class Multiplexer(object):
             self._connections = {}
             self._last_connection = None
 
-    # TODO (misc) is this sane or we should not support this (explicitly call close?)
+    # TODO (question) is this sane or we should not support this (explicitly call close?)
     def __del__(self):
         self.close()
 
@@ -765,7 +765,7 @@ class Database(object):
 # TODO maybe split the user facing API from the internal Command one (atleast mark it as _)
 # To know the result of a multi command simply resolve any command inside
 class MultiCommand(object):
-    __slots__ = '_database', '_retries', '_server', '_cmds', '_done'
+    __slots__ = '_database', '_retries', '_server', '_cmds', '_done', '_asking'
 
     def __init__(self, database, retries, server):
         self._database = database
@@ -773,6 +773,7 @@ class MultiCommand(object):
         self._server = server
         self._cmds = []
         self._done = False
+        self._asking = False
 
     def stream(self, chunk_size):
         return chunk_encoded_commands(self._cmds, chunk_size)

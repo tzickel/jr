@@ -23,6 +23,7 @@ An asynchronous redis client library for Python 2.7 and 3
 - [ ] API Finalization
 - [ ] Finish little holes in currently supported commands
 - [ ] Network I/O failure and concurrency tests
+- [ ] Choose license
 
 # Installing
 For now you can install this via this github repository by pip installing or adding to your requirements.txt file:
