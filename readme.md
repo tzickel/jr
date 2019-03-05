@@ -33,7 +33,7 @@ https://github.com/tzickel/jr/archive/master.zip
 
 Replace master with the specific branch or version tag you want.
 
-# Example
+# Examples
 This example uses an asynchronous syntax which is compatible with Python 2.7. You can call () on a redis command to resolve it's reply (or not if you don't care about the result). You can also use commandreply instead of command to resolve the reply directly.
 
 ```python
@@ -116,8 +116,9 @@ Multiplexer(configuration=None)
   close()
 ```
 
-Where configuration can be:
+Where configuration is a list of endpoints or a dictionary that can contain the following keys:
 
+* endpoints - The connection endpoints
 * password - The server password
 * connecttimeout - Set connect timeout in seconds
 * connectretry - Number of connection attempts before giving up

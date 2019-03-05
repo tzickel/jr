@@ -263,6 +263,15 @@ class TestCluster(unittest.TestCase):
         result = [i for s in result for i in s]
         self.assertEqual(set(result), set([b'aa', b'bb', b'cc']))
 
+    def test_moved(self):
+        self.assertEqual(self.cr0(b'set', b'aa', b'a'), b'OK')
+        self.assertEqual(self.cr0(b'set', b'bb', b'b'), b'OK')
+        self.assertEqual(self.cr0(b'set', b'cc', b'c'), b'OK')
+        result = self.mp.run_commandreply_on_all_masters(b'GET', b'aa')
+        self.assertEqual(len(result), 3)
+        result = list(result.values())
+        self.assertEqual(result, [b'a', b'a', b'a'])
+
 
 class TestPubSub(unittest.TestCase):
     def setUp(self):

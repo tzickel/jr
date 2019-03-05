@@ -53,10 +53,6 @@ except NameError:
 socket_errors = (IOError, OSError, socket.error, socket.timeout)
 
 
-# TODO refine this....
-command_retry_errors = (Exception)
-
-
 platform = ''
 if sys.platform.startswith('linux'):
     platform = 'linux'
@@ -240,12 +236,13 @@ def parse_command(source, *args, **kwargs):
 
 class Connection(object):
     __slots__ = 'socket', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'buffer', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
-    @classmethod
-    def create(cls, endpoint, config):
-        connectionhandler = config.get('connectionhandler', cls)
-        return connectionhandler(endpoint, config)
 
-    def __init__(self, endpoint, config):
+    @classmethod
+    def create(cls, endpoint, config, with_thread=True):
+        connectionhandler = config.get('connectionhandler', cls)
+        return connectionhandler(endpoint, config, with_thread)
+
+    def __init__(self, endpoint, config, with_thread):
         connecttimeout = config.get('connecttimeout', socket.getdefaulttimeout())
         connectretry = config.get('connectretry', 0) + 1
         sockettimeout = config.get('sockettimeout', socket.getdefaulttimeout())
@@ -274,6 +271,7 @@ class Connection(object):
         self.name = self.socket.getpeername()
         if self.socket.family == socket.AF_INET6:
             self.name = self.name[:2]
+        # TCP connection settings
         if isinstance(self.socket.getsockname(), tuple):
             if tcpnodelay:
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -297,29 +295,30 @@ class Connection(object):
         self.parser.send(None)
         self.lastdatabase = 0
         self.thread_event = None
-        if thread:
+        if with_thread and thread:
             self.thread_event = Event()
             self.thread = thread(self.loop)
+        # Password must be bytes or utf-8 encoded string
         password = config.get('password')
         if password is not None:
             cmd = Command((b'AUTH', password))
             try:
                 self.send(cmd)
                 cmd()
-            except:
+            except Exception:
                 self.close()
                 raise
 
-    # This should be exception safe
+    # This code should be exception safe
     def loop(self):
         while True:
+            # TODO is this meh ?
             self.thread_event.wait()
             self.thread_event.clear()
             if self.closed:
                 return
-            while True:
-                if not self.resolve():
-                    break
+            while self.resolve():
+                pass
 
     # Don't accept any new commands, but the read stream might still be alive
     def close_write(self):
@@ -355,25 +354,33 @@ class Connection(object):
                         self.socket.sendall(x)
                     self.commands.append(select_cmd)
                     self.lastdatabase = db_number
+                if cmd._asking:
+                    asking_cmd = Command((b'ASKING', ))
+                    for x in asking_cmd.stream(self.chunk_send_size):
+                        self.socket.sendall(x)
+                    cmd._asking = False
+                    self.commands.append(asking_cmd)
                 # We send before we append to commands list because another thread might do resolve, and this will race
                 for x in cmd.stream(self.chunk_send_size):
                     self.socket.sendall(x)
-                cmd.set_resolver(self)
-                # This is for pub/sub to not expect a result
-                if cmd._enqueue:
+                # pub/sub commands do not expect a result
+                if cmd.set_resolver(self):
                     self.commands.append(cmd)
                 if self.thread_event:
                     self.thread_event.set()
-        # We should only mark the socket for closing when it's dead
+        # We should only mark the socket for closing when it's dead (and not for example in decoder exception)
         except socket_errors as e:
             self.close_write()
             cmd.set_result(e)
         except Exception as e:
             cmd.set_result(e)
 
-    def resolve(self):
+    def resolve(self, cmd=None):
         try:
             with self.read_lock:
+                # Double lock safety check
+                if cmd and cmd._got_result:
+                    return False
                 cmd = self.commands.popleft()
                 num_results = cmd.how_many_results()
                 results = [self.recv() for _ in range(num_results)]
@@ -404,7 +411,6 @@ class Connection(object):
             raise
 
     def wait(self, timeout):
-        # I am hoping here that select on all platforms returns a read error on closing
         res = select([self.socket], [], [], timeout)
         if not res[0]:
             return False
@@ -412,7 +418,7 @@ class Connection(object):
 
 
 class Command(object):
-    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue', '_server'
+    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue', '_server', '_asking'
 
     def __init__(self, data, database=None, encoder=None, decoder=None, throw=True, retries=3, enqueue=True, server=None):
         self._data = data
@@ -426,6 +432,7 @@ class Command(object):
         self._resolver = None
         self._got_result = False
         self._result = None
+        self._asking = False
 
     def get_number(self):
         return self._database._number if self._database else None
@@ -441,21 +448,22 @@ class Command(object):
     def stream(self, chunk_size):
         return chunk_encoded_command(self, chunk_size)
 
-    # This causes encoding errors to be detected at socket I/O level (which can close it), but is faster otherwise
     def encode(self):
         return encode_command(self._data, self._encoder)
 
     def set_resolver(self, connection):
         if self._enqueue:
             self._resolver = connection
+        return self._enqueue
 
     def set_result(self, result, dont_retry=False):
         try:
             if not isinstance(result, Exception):
                 result = result[0]
-            if self._database and not dont_retry and self._retries and isinstance(result, command_retry_errors):
+            if self._database and not dont_retry and self._retries and isinstance(result, Exception):
                 self._retries -= 1
-                if not isinstance(result, RedisReplyError):
+                # We will only retry if it's a network I/O or some redis logic
+                if isinstance(result, socket_errors):
                     self._database._multiplexer._send_command(self)
                     return
                 else:
@@ -467,7 +475,25 @@ class Command(object):
                             self._data = (b'EVAL', script) + self._data[2:]
                             self._database._multiplexer._send_command(self)
                             return
-            # TODO (encoding) should we call decoder on Exceptions as well ?
+                    elif result.args[0].startswith('MOVED'):
+                        _, hashslot, addr = result.args[0].split(' ')
+                        hashslot = int(hashslot)
+                        addr = addr.rsplit(':', 1)
+                        addr = (addr[0], int(addr[1]))
+                        self._database._multiplexer._update_slots(moved_hint=(hashslot, addr))
+                        self._server = addr
+                        self._database._multiplexer._send_command(self)
+                        return
+                    elif result.args[0].startswith('ASKING'):
+                        _, hashslot, addr = result.args[0].split(' ')
+                        hashslot = int(hashslot)
+                        addr = addr.rsplit(':', 1)
+                        addr = (addr[0], int(addr[1]))
+                        self._asking = True
+                        self._server = addr
+                        self._database._multiplexer._send_command(self)
+                        return
+            # TODO should we call decoder on Exceptions as well ?
             self._result = result if not self._decoder else self._decoder(result)
             self._got_result = True
             self._data = None
@@ -485,7 +511,7 @@ class Command(object):
             raise RedisError('Command is not finalized yet')
         # This is a loop because of multi threading.
         while not self._got_result:
-            self._resolver.resolve()
+            self._resolver.resolve(self)
         if self._throw and isinstance(self._result, Exception):
             raise self._result
         return self._result
@@ -605,6 +631,7 @@ class Multiplexer(object):
                 self._update_slots()
                 raise
 
+    # TODO check if closed and dont allow
     def _send_command(self, cmd):
         server = cmd._server
         if not server:
@@ -738,7 +765,7 @@ class Database(object):
 # TODO maybe split the user facing API from the internal Command one (atleast mark it as _)
 # To know the result of a multi command simply resolve any command inside
 class MultiCommand(object):
-    __slots__ = '_database', '_retries', '_server', '_cmds', '_done', '_enqueue'
+    __slots__ = '_database', '_retries', '_server', '_cmds', '_done'
 
     def __init__(self, database, retries, server):
         self._database = database
@@ -746,7 +773,6 @@ class MultiCommand(object):
         self._server = server
         self._cmds = []
         self._done = False
-        self._enqueue = True
 
     def stream(self, chunk_size):
         return chunk_encoded_commands(self._cmds, chunk_size)
@@ -754,6 +780,7 @@ class MultiCommand(object):
     def set_resolver(self, connection):
         for cmd in self._cmds:
             cmd._resolver = connection
+        return True
 
     def get_number(self):
         return self._database._number
@@ -771,7 +798,7 @@ class MultiCommand(object):
         else:
             exec_res = result
         
-        if self._database and not dont_retry and self._retries and isinstance(exec_res, command_retry_errors):
+        if self._database and not dont_retry and self._retries and isinstance(exec_res, Exception):
             self._retries -= 1
             if not isinstance(exec_res, RedisReplyError):
                 self._database._multiplexer._send_command(self)
@@ -849,7 +876,7 @@ class PubSub(object):
             # TODO thread safety with _get_connection from multiplexer?
             for endpoint in self._multiplexer.endpoints():
                 try:
-                    self._connection = Connection.create(endpoint, self._multiplexer._configuration)
+                    self._connection = Connection.create(endpoint, self._multiplexer._configuration, False)
                     if thread:
                         self._thread = thread(self.loop)
                     break
