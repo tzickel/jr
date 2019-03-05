@@ -390,8 +390,8 @@ class Connection(object):
             pass
         except Exception as e:
             self.close()
-            # We should not retry if it/s I/O error (handle it inside)
-            cmd.set_result(e)
+            # We should not retry if it/s I/O error (it might have already been executed)
+            cmd.set_result(e, dont_retry=True)
             # We don't raise here, because it makes no sense ?
         return False
 
@@ -466,7 +466,7 @@ class Command(object):
                 if isinstance(result, socket_errors):
                     self._database._multiplexer._send_command(self)
                     return
-                else:
+                elif isinstance(result, RedisReplyError):
                     # hiredis exceptions are already encoded....
                     if result.args[0].startswith('NOSCRIPT'):
                         sha = self._data[1]
@@ -535,6 +535,7 @@ class Multiplexer(object):
         self._already_asking_for_slots = False
         self._slots = []
 
+    # TODO have a closed flag, and stop requesting new connections?
     def close(self):
         with self._lock:
             try:
@@ -554,7 +555,7 @@ class Multiplexer(object):
             raise RedisError('Redis cluster has no database selection support')
         return Database(self, number, encoder, decoder, retries, server)
 
-    # TODO support optional server instance for pub/sub ?
+    # TODO support optional server instance for pub/sub ? (for keyspace notification at least)
     def pubsub(self, encoder=None, decoder=None):
         if self._pubsub is None:
             with self._lock:
@@ -691,19 +692,14 @@ class Multiplexer(object):
                 self._clustered = False
             slots.sort(key=lambda x: x[0])
             slots = [(x[1], (x[2][0].decode(), x[2][1])) for x in slots]
-            self._slots = slots
-            return
-            # TODO fix this !!
             # release hosts not here from previous connections
-            remove_connections = set(self.connections) - set([x[1] for x in slots])
-            # TODO is this ok after connectionpool rewrite
+            remove_connections = set(self._connections) - set([x[1] for x in slots])
             for entry in remove_connections:
-                # the pop will make this not accept already in use sockets back
-                connections = self.connections.pop(entry)
-                connections.close()
-                #for conn in connections:
-                    #conn.close()
-                #connections.clear()
+                try:
+                    connections = self._connections.pop(entry)
+                    connections.close()
+                except Exception:
+                    pass
             self._slots = slots
         finally:
             self._already_asking_for_slots = False

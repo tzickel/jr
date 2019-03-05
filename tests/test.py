@@ -124,8 +124,15 @@ class TestCluster(unittest.TestCase):
         # Sometimes it takes awhile for the cluster to be ready
         wait = 50
         while wait:
-            if b'cluster_state:ok' in self.cr0(b'CLUSTER', b'INFO'):
+            result = self.mp.run_commandreply_on_all_masters(b'CLUSTER', b'INFO')
+            ready = True
+            for res in result.values():
+                if b'cluster_state:ok' not in res:
+                    ready = False
+            if ready:
                 break
+#            if b'cluster_state:ok' in self.cr0(b'CLUSTER', b'INFO'):
+#                break
             wait -= 1
         if not wait:
             raise Exception('Cluster is down, could not run test')

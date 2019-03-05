@@ -135,5 +135,5 @@ You can also manually set the execution environment by the os environment variab
 * gevent - gevent greenlets (needs gevent installed)
 * builtin_with_threads - preemptive multithreading
 
-# Partly inspired by
+# Partially inspired by
 The .NET Redis client package [ServiceStack.Redis](https://stackexchange.github.io/StackExchange.Redis/)
