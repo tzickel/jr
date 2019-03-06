@@ -585,29 +585,29 @@ class Multiplexer(object):
             if self._last_connection is None or self._last_connection.closed:
                 with self._lock:
                     if self._last_connection is None or self._last_connection.closed:
-                        # TODO should we enumerate self._uri or self.connections (which is not populated, maybe populate at start and avoid cluster problems)
-                        for num, addr in enumerate(list(self._endpoints)):
+                        # TODO should we enumerate self._endpoints or self._connections (which is not populated, maybe populate at start and avoid cluster problems)
+                        addresspool = list(self._endpoints)
+                        for num, addr in enumerate(addresspool):
                             self._tryindex = num
                             try:
                                 conn = self._connections.get(addr)
                                 if not conn or conn.closed:
                                     conn = Connection.create(addr, self._configuration)
-                                    # TODO is the name correct here? (in ipv4 yes, in ipv6 no ?)
                                     self._last_connection = self._connections[conn.name] = conn
-                                    self._last_connection = conn
                                     # TODO reset each time?
                                     if self._clustered is None:
                                         self._update_slots(with_connection=conn)
                                     return conn
                             except Exception as e:
-                                exp = e
+                                exc = e
                                 try:
                                     conn.close()
                                 except:
                                     pass
+                                # TODO remove or empty?
                                 self._connections.pop(addr, None)
                         self._last_connection = None
-                        raise exp
+                        raise exc
             return self._last_connection
         else:
             if not self._slots:
@@ -620,7 +620,7 @@ class Multiplexer(object):
             try:
                 conn = self._connections.get(addr)
                 if not conn or conn.closed:
-                    #TODO lock per conn
+                    #TODO do we want here a lock per connection ?
                     with self._lock:
                         conn = self._connections.get(addr)
                         if not conn or conn.closed:
@@ -636,19 +636,21 @@ class Multiplexer(object):
     def _send_command(self, cmd):
         server = cmd._server
         if not server:
+            # In multi, all commands must be in the same hashslot, so look for the first one
             if isinstance(cmd, MultiCommand) and self._clustered is not False:
-                for acmd in cmd._cmds[1:-1]:
-                    hashslot = self._get_command_from_cache(acmd)
+                for a_cmd in cmd._cmds[1:-1]:
+                    hashslot = self._get_command_from_cache(a_cmd)
                     if hashslot is not None:
                         break
             else:
                 hashslot = self._get_command_from_cache(cmd)
             connection = self._get_connection(hashslot)
         else:
+            # TODO should this be in get_connection ?
             try:
                 conn = self._connections.get(server)
                 if not conn or conn.closed:
-                    #TODO lock per conn
+                    #TODO do we want here a lock per connection ?
                     with self._lock:
                         conn = self._connections.get(server)
                         if not conn or conn.closed:
@@ -658,6 +660,7 @@ class Multiplexer(object):
             # TODO (misc) should we try getting another connection here ?
             except Exception:
                 self._update_slots()
+                # TODO not raise here, but cmd.set_result which will trigger a retry ? (and catch _update_slots error as well?)
                 raise
         connection.send(cmd)
 
@@ -694,6 +697,8 @@ class Multiplexer(object):
             slots = [(x[1], (x[2][0].decode(), x[2][1])) for x in slots]
             # release hosts not here from previous connections
             remove_connections = set(self._connections) - set([x[1] for x in slots])
+            if not self._clustered and with_connection:
+                remove_connections -= set([with_connection.name])
             for entry in remove_connections:
                 try:
                     connections = self._connections.pop(entry)
@@ -705,7 +710,6 @@ class Multiplexer(object):
             self._already_asking_for_slots = False
 
     # It is unreasonable to expect the user to provide us with the key index for each command so we ask the server and cache it
-    # TODO what to do in MULTI case ? maybe this should be in Command itself
     def _get_command_from_cache(self, cmd):
         if self._clustered is False:
             return None
@@ -717,7 +721,7 @@ class Multiplexer(object):
             info_cmd = Command((b'COMMAND', b'INFO', command_name))
             # If connection is dead, then the initiator command should retry
             self._get_connection().send(info_cmd)
-            # We do this check here, since _get_connection first try will trigger a clustred check and we need to abort if it's not (to not trigger the send_command's hashslot)
+            # We do this check here, since _get_connection first try will trigger a clustered check and we need to abort if it's not (to not trigger the send_command's hashslot)
             if self._clustered is False:
                 return None
             cmdinfo = info_cmd()[0]
@@ -871,6 +875,7 @@ class PubSub(object):
     def create_connection(self):
         if self._connection is None or self._connection.closed:
             # TODO thread safety with _get_connection from multiplexer?
+            # if empty...
             for endpoint in self._multiplexer.endpoints():
                 try:
                     self._connection = Connection.create(endpoint, self._multiplexer._configuration, False)

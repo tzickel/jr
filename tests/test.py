@@ -122,7 +122,7 @@ class TestCluster(unittest.TestCase):
         self.c0 = self.mp.database().command
         self.cr0 = self.mp.database().commandreply
         # Sometimes it takes awhile for the cluster to be ready
-        wait = 50
+        wait = 100
         while wait:
             result = self.mp.run_commandreply_on_all_masters(b'CLUSTER', b'INFO')
             ready = True
@@ -135,7 +135,7 @@ class TestCluster(unittest.TestCase):
 #                break
             wait -= 1
         if not wait:
-            raise Exception('Cluster is down, could not run test')
+            raise Exception('Cluster is down, could not run test: %s' % result)
 
     def tearDown(self):
         self.cr0 = None
@@ -214,6 +214,20 @@ class TestPubSub(unittest.TestCase):
         pubsub.ping('hi')
         self.assertEqual(pubsub.message(0.1), [b'pong', b'hi'])
         pubsub.remove('hi')
+
+
+class TestNetwork(unittest.TestCase):
+    class RedisServer(object):
+        # Open in a new thread
+        # with Hiredis
+        def __init__(self, port):
+            pass
+
+        def get_bulk(self):
+            pass
+
+        def send_bulk(self):
+            pass
 
 
 if __name__ == '__main__':
