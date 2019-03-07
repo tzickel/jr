@@ -50,7 +50,13 @@ class RedisServer(object):
         if self._proc:
             try:
                 self._proc.stdout.close()
+            except Exception:
+                pass
+            try:
                 self._proc.kill()
+            except Exception:
+                pass
+            try:
                 self._proc.wait()
             except Exception:
                 pass

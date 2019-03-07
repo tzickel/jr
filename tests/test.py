@@ -188,6 +188,16 @@ class TestCluster(unittest.TestCase):
         result = list(result.values())
         self.assertEqual(result, [b'a', b'a', b'a'])
 
+    def test_multi(self):
+        with self.mp.database().multi() as m:
+            cmd1 = m.command(b'SET', b'a', b'b')
+            cmd2 = m.command(b'GET', b'a')
+        self.assertEqual(cmd1(), b'OK')
+        self.assertEqual(cmd2(), b'b')
+
+    def test_eval(self):
+        self.assertEqual(self.cr0('eval', "return redis.call('get',ARGV[1])", 0, 'evaltest'), None)
+
 
 class TestPubSub(unittest.TestCase):
     def setUp(self):

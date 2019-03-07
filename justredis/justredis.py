@@ -234,6 +234,20 @@ def parse_command(source, *args, **kwargs):
     return Command(args, source, encoder, decoder, throw, retries, True, server)
 
 
+class Socket(object):
+    def __init__(self):
+        pass
+    
+    def read(self):
+        pass
+
+    def write(self):
+        pass
+
+    def ready(self):
+        pass
+
+
 class Connection(object):
     __slots__ = 'socket', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'buffer', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
 
@@ -312,7 +326,7 @@ class Connection(object):
     # This code should be exception safe
     def loop(self):
         while True:
-            # TODO is this meh ?
+            # TODO is this meh ? ( I think not !)
             self.thread_event.wait()
             self.thread_event.clear()
             if self.closed:
@@ -518,13 +532,12 @@ class Command(object):
 
 
 class Multiplexer(object):
-    __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_tryindex', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots'
+    __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots'
 
     def __init__(self, configuration=None):
         self._endpoints, self._configuration = parse_uri(configuration)
         self._connections = {}
         self._last_connection = None
-        self._tryindex = 0
         # The reason we do double dictionary here is for faster lookup in case of lookup failure and multi threading protection
         self._scripts = {}
         self._scripts_sha = {}
@@ -535,14 +548,14 @@ class Multiplexer(object):
         self._already_asking_for_slots = False
         self._slots = []
 
-    # TODO have a closed flag, and stop requesting new connections?
+    # TODO have a closed flag, and stop requesting new connections? (no, it should be reusable?)
     def close(self):
         with self._lock:
-            try:
-                for connection in self._connections.values():
+            for connection in self._connections.values():
+                try:
                     connection.close()
-            except Exception:
-                pass
+                except Exception:
+                    pass
             self._connections = {}
             self._last_connection = None
 
@@ -565,19 +578,24 @@ class Multiplexer(object):
 
     def endpoints(self):
         if self._clustered is None:
-            self._get_connection()
+            self._update_slots()
         # TODO is this atomic ?
-        if self._clustered:
-            return [x[1] for x in list(self._slots)]
-        else:
-            return list(self._connections.keys())
+        return list(self._connections.keys())
 
     def run_commandreply_on_all_masters(self, *args, **kwargs):
+        return self.run_commandreply_on_all('masters', *args, **kwargs)
+
+    def run_commandreply_on_all(self, who='masters', *args, **kwargs):
         if self._clustered is False:
             raise RedisError('This command only runs on cluster mode')
+        if who != 'masters':
+            raise RedisError('Currently only masters supported')
         res = {}
         for endpoint in self.endpoints():
-            res[endpoint] = self.database(server=endpoint).commandreply(*args, **kwargs)
+            try:
+                res[endpoint] = self.database(server=endpoint).commandreply(*args, **kwargs)
+            except Exception as e:
+                res[endpoint] = e
         return res
 
     def _get_connection(self, hashslot=None):
@@ -586,9 +604,8 @@ class Multiplexer(object):
                 with self._lock:
                     if self._last_connection is None or self._last_connection.closed:
                         # TODO should we enumerate self._endpoints or self._connections (which is not populated, maybe populate at start and avoid cluster problems)
-                        addresspool = list(self._endpoints)
-                        for num, addr in enumerate(addresspool):
-                            self._tryindex = num
+                        addresspool = self._endpoints if not self._clustered else list(self._connections.keys())
+                        for addr in addresspool:
                             try:
                                 conn = self._connections.get(addr)
                                 if not conn or conn.closed:
@@ -597,33 +614,32 @@ class Multiplexer(object):
                                     # TODO reset each time?
                                     if self._clustered is None:
                                         self._update_slots(with_connection=conn)
-                                    return conn
+                                else:
+                                    self._last_connection = conn
+                                return conn
                             except Exception as e:
                                 exc = e
                                 try:
                                     conn.close()
                                 except:
                                     pass
-                                # TODO remove or empty?
-                                self._connections.pop(addr, None)
+                                self._connections[addr] = None
                         self._last_connection = None
                         raise exc
             return self._last_connection
         else:
-            if not self._slots:
-                self._update_slots()
+            # We don't have to update _slots here, since the call to _get_command_from_cache (which is a prequesite) already updated it if needed.
             for slot in self._slots:
-                if hashslot > slot[0]:
-                    continue
-                break
+                if hashslot <= slot[0]:
+                    break
             addr = slot[1]
             try:
                 conn = self._connections.get(addr)
                 if not conn or conn.closed:
-                    #TODO do we want here a lock per connection ?
+                    # TODO do we want here a lock per connection ?
                     with self._lock:
                         conn = self._connections.get(addr)
-                        if not conn or conn.closed:
+                        if conn is None or conn.closed:
                             conn = Connection.create(addr, self._configuration)
                             self._connections[addr] = conn
                 return conn
@@ -646,7 +662,6 @@ class Multiplexer(object):
                 hashslot = self._get_command_from_cache(cmd)
             connection = self._get_connection(hashslot)
         else:
-            # TODO should this be in get_connection ?
             try:
                 conn = self._connections.get(server)
                 if not conn or conn.closed:
@@ -655,7 +670,9 @@ class Multiplexer(object):
                         conn = self._connections.get(server)
                         if not conn or conn.closed:
                             conn = Connection.create(server, self._configuration)
-                            self._connections[server] = conn
+                            # We only put the server back if it's relevent
+                            if server in self._connections:
+                                self._connections[server] = conn
                 connection = conn
             # TODO (misc) should we try getting another connection here ?
             except Exception:
@@ -673,9 +690,8 @@ class Multiplexer(object):
         if moved_hint and self._slots:
             hashslot, addr = moved_hint
             for slot in self._slots:
-                if hashslot > slot[0]:
-                    continue
-                break
+                if hashslot <= slot[0]:
+                    break
             # We already know this, don't retry getting a new world view
             if addr == slot[1]:
                 return
@@ -695,16 +711,30 @@ class Multiplexer(object):
                 self._clustered = False
             slots.sort(key=lambda x: x[0])
             slots = [(x[1], (x[2][0].decode(), x[2][1])) for x in slots]
-            # release hosts not here from previous connections
-            remove_connections = set(self._connections) - set([x[1] for x in slots])
-            if not self._clustered and with_connection:
-                remove_connections -= set([with_connection.name])
-            for entry in remove_connections:
-                try:
-                    connections = self._connections.pop(entry)
-                    connections.close()
-                except Exception:
-                    pass
+            # resync connections list with slot list
+            # TODO should we lock connections while updating ? recursive lock ?
+            if self._clustered:
+                current_addresses = set(self._connections)
+                new_addresses = set([x[1] for x in slots])
+                for address in current_addresses ^ new_addresses:
+                    if address in current_addresses and address not in new_addresses:
+                        try:
+                            connections = self._connections.pop(entry)
+                            connections.close()
+                        except Exception:
+                            pass
+                    elif address not in current_addresses and address in new_addresses:
+                        self._connections.setdefault(address, None)
+            else:
+                for address in set(self._connections):
+                    if connection.name != address:
+                        try:
+                            connections = self._connections.pop(entry)
+                            connections.close()
+                        except Exception:
+                            pass
+                if connection.name not in self._connections:
+                    self._connection[connection.name] = connection
             self._slots = slots
         finally:
             self._already_asking_for_slots = False
@@ -727,6 +757,11 @@ class Multiplexer(object):
             cmdinfo = info_cmd()[0]
             # If the server does not know the command, we can't redirect it properly in cluster mode
             keyindex = cmdinfo[3] if cmdinfo else 0
+            # TODO add other movablekey commands
+            if cmdinfo[0] in (b'eval', b'evalsha'):
+                keyindex = 3
+            elif cmdinfo[0] in (b'zunionstore', b'zinterstore'):
+                keyindex = 1
             self._command_cache[command_name] = keyindex
         if keyindex == 0:
             return None
