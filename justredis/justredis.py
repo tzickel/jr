@@ -62,8 +62,8 @@ elif sys.platform.startswith('win'):
     platform = 'windows'
 
 
-# TODO change to set
-not_allowed_commands = (b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE')
+# TODO (question) what other commands to put here ?
+not_allowed_commands = {b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE', b'MONITOR'}
 
 
 # Basic encoder
@@ -272,6 +272,9 @@ class Transport(object):
         self._socket = None
         self._buffer = None
 
+    def flush(self):
+        pass
+
 
 class UnixTransport(Transport):
     @classmethod
@@ -314,11 +317,12 @@ class TcpTransport(Transport):
         return obj
 
 
+# TODO add ony_way
 class Connection(object):
     __slots__ = '_transport', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
 
     @classmethod
-    def create(cls, endpoint, configuration, one_way=False):
+    def create(cls, endpoint, configuration):
         transport = configuration.get('transport', TcpTransport)
         connectretry = configuration.get('connectretry', 0) + 1
         while connectretry:
@@ -331,8 +335,9 @@ class Connection(object):
                     raise RedisError('Connection failed: %r' % e)
         return cls(connection, configuration, one_way)
 
-    def __init__(self, transport, configuration, one_way):
+    def __init__(self, transport, configuration):
         self._transport = transport
+        self._one_way = one_way
         # needed for cluster support
         self.name = self._transport.name()
         self.commands = deque()
