@@ -234,86 +234,121 @@ def parse_command(source, *args, **kwargs):
     return Command(args, source, encoder, decoder, throw, retries, True, server)
 
 
-class Socket(object):
-    def __init__(self):
-        pass
+class Transport(object):
+    __slots__ = '_buffer', '_socket'
+
+    def __init__(self, configuration):
+        buffersize = configuration.get('recvbuffersize', 16384)
+        self._buffer = bytearray(buffersize)
+
+    @classmethod
+    def create(cls, endpoint, configuration):
+        raise NotImplementedError()
     
     def read(self):
-        pass
+        length = self._socket.recv_into(self._buffer)
+        if length == 0:
+            raise RedisError('Connection closed')
+        return self._buffer, 0, length
 
-    def write(self):
-        pass
+    def write(self, data):
+        self._socket.sendall(data)
 
-    def ready(self):
-        pass
+    def ready(self, timeout=None):
+        res = select([self._socket], [], [], timeout)
+        return True if res[0] else False
+
+    def name(self):
+        res = self._socket.getpeername()
+        if self._socket.family == socket.AF_INET6:
+            res = res[:2]
+        return res
+
+    def close(self):
+        try:
+            self._socket.close()
+        except Exception:
+            pass
+        self._socket = None
+        self._buffer = None
+
+
+class UnixTransport(Transport):
+    @classmethod
+    def create(cls, endpoint, configuration):
+        connecttimeout = configuration.get('connecttimeout', socket.getdefaulttimeout())
+        sockettimeout = configuration.get('sockettimeout', socket.getdefaulttimeout())
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(connecttimeout)
+        sock.connect(endpoint)
+        sock.settimeout(sockettimeout)
+        obj = cls(configuration)
+        obj._socket = sock
+        return obj
+
+
+class TcpTransport(Transport):
+    @classmethod
+    def create(cls, endpoint, configuration):
+        connecttimeout = configuration.get('connecttimeout', socket.getdefaulttimeout())
+        sockettimeout = configuration.get('sockettimeout', socket.getdefaulttimeout())
+        tcpkeepalive = configuration.get('tcpkeepalive', 300)
+        tcpnodelay = configuration.get('tcpnodelay', False)
+        sock = socket.create_connection(endpoint, timeout=connecttimeout)
+        sock.settimeout(sockettimeout)
+        if isinstance(sock.getsockname(), tuple):
+            if tcpnodelay:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if tcpkeepalive:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if platform == 'linux':
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, tcpkeepalive)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, tcpkeepalive // 3)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                elif platform == 'darwin':
+                    sock.setsockopt(socket.IPPROTO_TCP, 0x10, tcpkeepalive // 3)
+                elif platform == 'windows':
+                    sock.ioctl(SIO_KEEPALIVE_VALS, (1, tcpkeepalive * 1000, tcpkeepalive // 3 * 1000))
+        obj = cls(configuration)
+        obj._socket = sock
+        return obj
 
 
 class Connection(object):
-    __slots__ = 'socket', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'buffer', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
+    __slots__ = '_transport', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
 
     @classmethod
-    def create(cls, endpoint, config, with_thread=True):
-        connectionhandler = config.get('connectionhandler', cls)
-        return connectionhandler(endpoint, config, with_thread)
-
-    def __init__(self, endpoint, config, with_thread):
-        connecttimeout = config.get('connecttimeout', socket.getdefaulttimeout())
-        connectretry = config.get('connectretry', 0) + 1
-        sockettimeout = config.get('sockettimeout', socket.getdefaulttimeout())
-        buffersize = config.get('recvbuffersize', 16384)
-        tcpkeepalive = config.get('tcpkeepalive', 300)
-        tcpnodelay = config.get('tcpnodelay', False)
+    def create(cls, endpoint, configuration, one_way=False):
+        transport = configuration.get('transport', TcpTransport)
+        connectretry = configuration.get('connectretry', 0) + 1
         while connectretry:
             try:
-                if isinstance(endpoint, str):
-                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    sock.settimeout(connecttimeout)
-                    sock.connect(endpoint)
-                    sock.settimeout(sockettimeout)
-                    self.socket = sock
-                elif isinstance(endpoint, tuple):
-                    self.socket = socket.create_connection(endpoint, timeout=connecttimeout)
-                    self.socket.settimeout(sockettimeout)
-                else:
-                    raise RedisError('Invalid endpoint')
+                connection = transport.create(endpoint, configuration)
                 break
             except connect_errors as e:
                 connectretry -= 1
                 if not connectretry:
                     raise RedisError('Connection failed: %r' % e)
+        return cls(connection, configuration, one_way)
+
+    def __init__(self, transport, configuration, one_way):
+        self._transport = transport
         # needed for cluster support
-        self.name = self.socket.getpeername()
-        if self.socket.family == socket.AF_INET6:
-            self.name = self.name[:2]
-        # TCP connection settings
-        if isinstance(self.socket.getsockname(), tuple):
-            if tcpnodelay:
-                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            if tcpkeepalive:
-                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                if platform == 'linux':
-                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, tcpkeepalive)
-                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, tcpkeepalive // 3)
-                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-                elif platform == 'darwin':
-                    self.socket.setsockopt(socket.IPPROTO_TCP, 0x10, tcpkeepalive // 3)
-                elif platform == 'windows':
-                    self.socket.ioctl(SIO_KEEPALIVE_VALS, (1, tcpkeepalive * 1000, tcpkeepalive // 3 * 1000))
+        self.name = self._transport.name()
         self.commands = deque()
         self.closed = False
         self.read_lock = Lock()
         self.send_lock = Lock()
         self.chunk_send_size = 6000
-        self.buffer = bytearray(buffersize)
         self.parser = hiredis_parser()
         self.parser.send(None)
         self.lastdatabase = 0
         self.thread_event = None
-        if with_thread and thread:
+        if thread:
             self.thread_event = Event()
             self.thread = thread(self.loop)
         # Password must be bytes or utf-8 encoded string
-        password = config.get('password')
+        password = configuration.get('password')
         if password is not None:
             cmd = Command((b'AUTH', password))
             try:
@@ -341,11 +376,11 @@ class Connection(object):
     def close(self):
         self.closed = True
         try:
-            self.socket.close()
+            self._transport.close()
         except Exception:
             pass
         finally:
-            self.socket = None
+            self._transport = None
             if self.commands:
                 # Hmmm... I think there is no threading issue here with regards to other uses of read/send locks in the code ?
                 with self.read_lock:
@@ -365,18 +400,18 @@ class Connection(object):
                 if db_number is not None and db_number != self.lastdatabase:
                     select_cmd = Command((b'SELECT', db_number))
                     for x in select_cmd.stream(self.chunk_send_size):
-                        self.socket.sendall(x)
+                        self._transport.write(x)
                     self.commands.append(select_cmd)
                     self.lastdatabase = db_number
                 if cmd._asking:
                     asking_cmd = Command((b'ASKING', ))
                     for x in asking_cmd.stream(self.chunk_send_size):
-                        self.socket.sendall(x)
+                        self._transport.write(x)
                     cmd._asking = False
                     self.commands.append(asking_cmd)
                 # We send before we append to commands list because another thread might do resolve, and this will race
                 for x in cmd.stream(self.chunk_send_size):
-                    self.socket.sendall(x)
+                    self._transport.write(x)
                 # pub/sub commands do not expect a result
                 if cmd.set_resolver(self):
                     self.commands.append(cmd)
@@ -415,20 +450,17 @@ class Connection(object):
             while res is False:
                 if allow_empty:
                     return res
-                length = self.socket.recv_into(self.buffer)
+                data, offset, length = self._transport.read()
                 if length == 0:
                     raise RedisError('Connection closed')
-                res = self.parser.send((self.buffer, 0, length))
+                res = self.parser.send((data, 0, length))
             return res
         except Exception:
             self.close()
             raise
 
     def wait(self, timeout):
-        res = select([self.socket], [], [], timeout)
-        if not res[0]:
-            return False
-        return True
+        return self._transport.ready(timeout)
 
 
 class Command(object):
