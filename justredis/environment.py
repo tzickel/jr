@@ -22,6 +22,10 @@ def builtin():
     import socket
     from threading import Lock, Event
     from select import select
+    try:
+        from Queue import Queue
+    except ModuleNotFoundError:
+        from queue import Queue
 
     env = {}
     env["socket"] = socket
@@ -29,6 +33,7 @@ def builtin():
     env["Event"] = Event
     env["select"] = select
     env["thread"] = None
+    env["Queue"] = Queue
     return env
 
 
@@ -36,6 +41,10 @@ def builtin_with_threads():
     import socket
     from threading import Lock, Event, Thread
     from select import select
+    try:
+        from Queue import Queue
+    except ModuleNotFoundError:
+        from queue import Queue
 
     def thread(target):
         t = Thread(target=target)
@@ -49,6 +58,7 @@ def builtin_with_threads():
     env["Event"] = Event
     env["select"] = select
     env["thread"] = thread
+    env["Queue"] = Queue
     return env
 
 
@@ -58,6 +68,7 @@ def gevent():
     from gevent.event import Event
     from gevent.select import select
     from gevent import spawn
+    from gevent.queue import Queue
 
     env = {}
     env["socket"] = socket
@@ -65,6 +76,7 @@ def gevent():
     env["Event"] = Event
     env["select"] = select
     env["thread"] = lambda x: spawn(x)
+    env["Queue"] = Queue
     return env
 
 

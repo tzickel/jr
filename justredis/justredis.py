@@ -10,7 +10,7 @@ import hiredis
 
 # Execution environment
 from .environment import get_env
-Lock, Event, socket, select, thread = get_env("Lock", "Event", "socket", "select", "thread")
+Lock, Event, socket, select, thread, Queue = get_env("Lock", "Event", "socket", "select", "thread", "Queue")
 
 
 # Exceptions
@@ -272,9 +272,6 @@ class Transport(object):
         self._socket = None
         self._buffer = None
 
-    def flush(self):
-        pass
-
 
 class UnixTransport(Transport):
     @classmethod
@@ -317,51 +314,114 @@ class TcpTransport(Transport):
         return obj
 
 
-# TODO add ony_way
-class Connection(object):
-    __slots__ = '_transport', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
+class Protocol(object):
+    __slots__ = '_transport', '_parser', '_chunk_send_size'
 
-    @classmethod
-    def create(cls, endpoint, configuration):
-        transport = configuration.get('transport', TcpTransport)
-        connectretry = configuration.get('connectretry', 0) + 1
-        while connectretry:
-            try:
-                connection = transport.create(endpoint, configuration)
-                break
-            except connect_errors as e:
-                connectretry -= 1
-                if not connectretry:
-                    raise RedisError('Connection failed: %r' % e)
-        return cls(connection, configuration, one_way)
-
-    def __init__(self, transport, configuration):
+    def __init__(self, transport):
         self._transport = transport
-        self._one_way = one_way
-        # needed for cluster support
-        self.name = self._transport.name()
-        self.commands = deque()
-        self.closed = False
-        self.read_lock = Lock()
-        self.send_lock = Lock()
-        self.chunk_send_size = 6000
-        self.parser = hiredis_parser()
-        self.parser.send(None)
-        self.lastdatabase = 0
-        self.thread_event = None
-        if thread:
-            self.thread_event = Event()
-            self.thread = thread(self.loop)
+        self._parser = hiredis_parser()
+        self._parser.send(None)
+        self._chunk_send_size = 6000
+
+    def read(self, allow_empty=False):
+        res = self._parser.send(None)
+        while res is False:
+            if allow_empty:
+                return res
+            data, offset, length = self._transport.read()
+            if length == 0:
+                raise RedisError('Connection closed')
+            res = self._parser.send((data, 0, length))
+        return res
+    
+    def write(self, cmd):
+        for x in cmd.stream(self._chunk_send_size):
+            self._transport.write(x)
+
+    def close(self):
+        try:
+            self._transport.close()
+        except Exception:
+            pass
+        self._transport = None
+        self._parser = None
+
+
+# TODO add ony_way (if no commands in list, put it in some result list ?)
+# TODO what is retry connect strategy ?
+class Connection(object):
+#    __slots__ = '_transport', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
+
+    def __init__(self, endpoint, configuration):
+        self._endpoint = endpoint
+        self._configuration = configuration
+        self._transport_class = configuration.get('transport', TcpTransport)
+        self._connectretry = configuration.get('connectretry', 0) + 1
         # Password must be bytes or utf-8 encoded string
-        password = configuration.get('password')
-        if password is not None:
-            cmd = Command((b'AUTH', password))
-            try:
-                self.send(cmd)
-                cmd()
-            except Exception:
-                self.close()
-                raise
+        self._password = configuration.get('password')
+        self._transport = None
+        self._protocol = None
+        self._name = None
+        self._lastdatabase = 0
+        self._one_way = False
+        self._read_lock = Lock()
+        self._write_lock = Lock()
+        self._connect_lock = Lock()
+        self._commands = deque()
+        self._enqueued_event = Event()
+#        self._thread_event = None
+#            self.thread_event = Event()
+#            self.thread = thread(self.loop)
+
+    @property
+    def closed(self):
+        return self._protocol is None
+
+    # TODO for pubsub
+    def on_connect(self):
+        pass
+    
+    # TODO what for ?
+    def on_disconnect(self):
+        pass
+
+    # TODO timeout command for how long to wait ?
+    def connect(self):
+        if not self._protocol:
+            should_run_on_connect = False
+            with self._connect_lock:
+                # Some threads might be in the read_lock part, so take it.
+                print(1)
+                with self._read_lock:
+                    if not self._protocol:
+                        connectretry = self._connectretry
+                        while connectretry:
+                            try:
+                                self._transport = self._transport_class.create(self._endpoint, self._configuration)
+                                # needed for cluster support
+                                self._name = self._transport.name()
+                                self._protocol = Protocol(self._transport)
+                                self._lastdatabase = 0
+                                self._commands.clear()
+                                self._one_way = False
+                                should_run_on_connect = True
+                                break
+                            except connect_errors as e:
+                                connectretry -= 1
+                                if not connectretry:
+                                    raise RedisError('Connection failed: %r' % e)
+                        if self._password is not None:
+                            cmd = Command((b'AUTH', self._password))
+                            self.send(cmd)
+            if self._password:
+                try:
+                    cmd()
+                except Exception:
+                    self.close()
+                    raise
+            # must do outside of connect lock
+            if should_run_on_connect:
+                self.on_connect()
 
     # This code should be exception safe
     def loop(self):
@@ -374,98 +434,84 @@ class Connection(object):
             while self.resolve():
                 pass
 
-    # Don't accept any new commands, but the read stream might still be alive
-    def close_write(self):
-        self.closed = True
-
-    def close(self):
-        self.closed = True
+    def close(self, e=None):
         try:
-            self._transport.close()
+            self._protocol.close()
         except Exception:
             pass
         finally:
-            self._transport = None
-            if self.commands:
-                # Hmmm... I think there is no threading issue here with regards to other uses of read/send locks in the code ?
-                with self.read_lock:
-                    with self.send_lock:
-                        for command in self.commands:
+            # Hmmm... I think there is no threading issue here with regards to other uses of read/send locks in the code ?
+            print(3)
+            with self._read_lock:
+                with self._write_lock:
+                    with self._connect_lock:
+                        self._transport = None
+                        self._protocol = None
+                        for command in self._commands:
                             # This are already sent and we don't know if they happened or not.
-                            command.set_result(RedisError('Connection closed'), dont_retry=True)
-                        self.commands = []
-            if self.thread_event:
-                self.thread_event.set()
+                            command.set_result(e or RedisError('Connection closed'), dont_retry=True)
+                        self._commands.clear()
+#            if self.thread_event:
+#                self.thread_event.set()
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
     def send(self, cmd):
         try:
-            with self.send_lock:
+            if cmd._got_result:
+                raise RedisError('Command already processed')
+            self.connect()
+            with self._write_lock:
                 db_number = cmd.get_number()
-                if db_number is not None and db_number != self.lastdatabase:
+                if db_number is not None and db_number != self._lastdatabase:
                     select_cmd = Command((b'SELECT', db_number))
-                    for x in select_cmd.stream(self.chunk_send_size):
-                        self._transport.write(x)
-                    self.commands.append(select_cmd)
-                    self.lastdatabase = db_number
+                    self._protocol.write(select_cmd)
+                    self._commands.append(select_cmd)
+                    self._lastdatabase = db_number
                 if cmd._asking:
                     asking_cmd = Command((b'ASKING', ))
-                    for x in asking_cmd.stream(self.chunk_send_size):
-                        self._transport.write(x)
+                    self._protocol.write(asking_cmd)
+                    self._commands.append(asking_cmd)
                     cmd._asking = False
-                    self.commands.append(asking_cmd)
                 # We send before we append to commands list because another thread might do resolve, and this will race
-                for x in cmd.stream(self.chunk_send_size):
-                    self._transport.write(x)
+                self._protocol.write(cmd)
                 # pub/sub commands do not expect a result
                 if cmd.set_resolver(self):
-                    self.commands.append(cmd)
-                if self.thread_event:
-                    self.thread_event.set()
+                    self._commands.append(cmd)
+                else:
+                    # TODO what now (also how do we revert)
+                    self._one_way = True
+#                if self.thread_event:
+#                    self.thread_event.set()
         # We should only mark the socket for closing when it's dead (and not for example in decoder exception)
         except socket_errors as e:
-            self.close_write()
-            cmd.set_result(e)
+            self.close()
+#            self.close_write()
+# TODO really dont_retry ?
+            cmd.set_result(e, dont_retry=True)
         except Exception as e:
-            cmd.set_result(e)
+            cmd.set_result(e, dont_retry=True)
 
-    def resolve(self, cmd=None):
+    def read(self, calling_cmd=None):
         try:
-            with self.read_lock:
+            print(2)
+            with self._read_lock:
                 # Double lock safety check
-                if cmd and cmd._got_result:
+                if calling_cmd and calling_cmd._got_result:
                     return False
-                cmd = self.commands.popleft()
+                cmd = self._commands.popleft()
                 num_results = cmd.how_many_results()
-                results = [self.recv() for _ in range(num_results)]
+                # self._protocol cannot be None here (because of locking)
+                results = [self._protocol.read() for _ in range(num_results)]
             cmd.set_result(results)
             return True
         except IndexError:
             pass
         except Exception as e:
             self.close()
-            # We should not retry if it/s I/O error (it might have already been executed)
+            # We should not retry if it's I/O error (it might have already been executed)
             cmd.set_result(e, dont_retry=True)
-            # We don't raise here, because it makes no sense ?
+            # We don't raise here, because it makes no sense
         return False
-
-    def recv(self, allow_empty=False):
-        try:
-            res = self.parser.send(None)
-            while res is False:
-                if allow_empty:
-                    return res
-                data, offset, length = self._transport.read()
-                if length == 0:
-                    raise RedisError('Connection closed')
-                res = self.parser.send((data, 0, length))
-            return res
-        except Exception:
-            self.close()
-            raise
-
-    def wait(self, timeout):
-        return self._transport.ready(timeout)
 
 
 class Command(object):
@@ -562,7 +608,7 @@ class Command(object):
             raise RedisError('Command is not finalized yet')
         # This is a loop because of multi threading.
         while not self._got_result:
-            self._resolver.resolve(self)
+            self._resolver.read(self)
         if self._throw and isinstance(self._result, Exception):
             raise self._result
         return self._result
@@ -584,6 +630,9 @@ class Multiplexer(object):
         self._command_cache = {}
         self._already_asking_for_slots = False
         self._slots = []
+        for endpoint in self._endpoints:
+            # Since we don't actually connect here, the endpoint name might be different but we don't care
+            self._connections[endpoint] = Connection(endpoint, self._configuration)
 
     # TODO have a closed flag, and stop requesting new connections? (no, it should be reusable?)
     def close(self):
@@ -640,29 +689,23 @@ class Multiplexer(object):
             if self._last_connection is None or self._last_connection.closed:
                 with self._lock:
                     if self._last_connection is None or self._last_connection.closed:
-                        # TODO should we enumerate self._endpoints or self._connections (which is not populated, maybe populate at start and avoid cluster problems)
-                        addresspool = self._endpoints if not self._clustered else list(self._connections.keys())
-                        for addr in addresspool:
-                            try:
-                                conn = self._connections.get(addr)
-                                if not conn or conn.closed:
-                                    conn = Connection.create(addr, self._configuration)
-                                    self._last_connection = self._connections[conn.name] = conn
-                                    # TODO reset each time?
-                                    if self._clustered is None:
-                                        self._update_slots(with_connection=conn)
-                                else:
-                                    self._last_connection = conn
-                                return conn
-                            except Exception as e:
-                                exc = e
+                        addrlist = list(self._connections.values())
+                        for connection in addrlist:
+                            if not connection.closed:
+                                self._last_connection = connection
+                                break
+                        else:
+                            for connection in addrlist:
                                 try:
-                                    conn.close()
-                                except:
-                                    pass
-                                self._connections[addr] = None
-                        self._last_connection = None
-                        raise exc
+                                    connection.connect()
+                                    self._last_connection = connection
+                                    break
+                                except Exception as e:
+                                    exc = e
+                            else:
+                                raise exc
+                        # If a server is not answering, update my world view ?
+#                        self._update_slots(with_connection=connection)
             return self._last_connection
         else:
             # We don't have to update _slots here, since the call to _get_command_from_cache (which is a prequesite) already updated it if needed.
@@ -701,7 +744,7 @@ class Multiplexer(object):
         else:
             try:
                 conn = self._connections.get(server)
-                if not conn or conn.closed:
+                if not conn:
                     #TODO do we want here a lock per connection ?
                     with self._lock:
                         conn = self._connections.get(server)
