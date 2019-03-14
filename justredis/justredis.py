@@ -272,6 +272,7 @@ class Transport(object):
         self._socket = None
         self._buffer = None
 
+    # TODO remove this ?
     def wait(self, timeout=None):
         res = select([self._socket], [], [], timeout)
         return True if res[0] else False
@@ -390,23 +391,18 @@ class Connection(object):
         self._read_lock = Lock()
         self._send_lock = Lock()
         self._commands = deque()
-#        self._enqueued_event = Event()
-        """
-        self._thread_event = None
-            self.thread_event = Event()
+        if thread:
             self.thread = thread(self.loop)
 
     # This code should be exception safe
+    # TODO WHAT TO DO ABOUT PUBSUB ?
     def loop(self):
         while True:
-            # TODO is this meh ? ( I think not !)
-            self.thread_event.wait()
-            self.thread_event.clear()
             if self.closed:
                 return
             while self.resolve():
                 pass
-"""
+
     def close(self, e=None):
         self.closed = True
         try:
@@ -423,8 +419,6 @@ class Connection(object):
                         # This are already sent and we don't know if they happened or not.
                         command.set_result(e, dont_retry=True)
                     self._commands.clear()
-#            if self.thread_event:
-#                self.thread_event.set()
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
     def send(self, cmd):
@@ -437,25 +431,20 @@ class Connection(object):
                 db_number = cmd.get_number()
                 if db_number is not None and db_number != self._lastdatabase:
                     select_cmd = Command((b'SELECT', db_number))
-                    self._protocol.write(select_cmd)
                     self._commands.append(select_cmd)
+                    self._protocol.write(select_cmd)
                     self._lastdatabase = db_number
                 if cmd._asking:
                     asking_cmd = Command((b'ASKING', ))
-                    self._protocol.write(asking_cmd)
                     self._commands.append(asking_cmd)
+                    self._protocol.write(asking_cmd)
                     cmd._asking = False
-                # pub/sub commands do not expect a result
+                # pub/sub commands do not expect a result (mark this as one-way connection so others dont try)
                 if cmd.set_resolver(self):
                     # TODO enforce this can't be in one way mode
                     self._commands.append(cmd)
-                #else:
-                    # TODO what now (also how do we revert)
-                    #self._one_way = True
-                # We send before we append to commands list because another thread might do resolve, and this will race
+                # We send after adding to command list to make use of blocking I/O of the other read side
                 self._protocol.write(cmd)
-#                if self.thread_event:
-#                    self.thread_event.set()
         # We should only mark the socket for closing when it's dead (and not for example in decoder exception)
         except socket_errors as e:
             self.close()
@@ -488,29 +477,9 @@ class Connection(object):
         except Exception as e:
             self.close()
             # We should not retry if it's I/O error (it might have already been executed)
+            # TODO cmd might not exist ? do a check
             cmd.set_result(e, dont_retry=True)
         return False
-
-    # TODO before doing this make sure command queue it empty !
-    def read_message(self, max_timeout=None):
-        if self.closed:
-            raise RedisError('Connection closed')
-        try:
-            got_lock = self._read_lock.acquire(False)
-            if not got_lock:
-                self._transport.wait(max_timeout)
-            else:
-                with self._read_lock:
-                    res = self._protocol.recv(allow_empty=True)
-                    if res is False:
-                        if self._transport.wait(max_timeout):
-                            res = self._connection.recv()
-                        else:
-                            res = None
-                    return res
-        except Exception as e:
-            self.close()
-            raise
 
 
 class Command(object):
