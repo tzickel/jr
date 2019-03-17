@@ -266,16 +266,15 @@ class Transport(object):
 
     def close(self):
         try:
+            self._socket.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
             self._socket.close()
         except Exception:
             pass
         self._socket = None
         self._buffer = None
-
-    # TODO remove this ?
-    def wait(self, timeout=None):
-        res = select([self._socket], [], [], timeout)
-        return True if res[0] else False
 
 
 class UnixTransport(Transport):
@@ -380,6 +379,8 @@ class Connection(object):
             except Exception as e:
                 connection.close()
                 raise
+        if thread:
+            connection._thread = thread(connection.loop)
         return connection
 
     def __init__(self, transport):
@@ -388,20 +389,18 @@ class Connection(object):
         self.name = transport.name
         self.closed = False
         self._lastdatabase = 0
-        self._read_lock = Lock()
-        self._send_lock = Lock()
+        self._read_lock = Lock('read')
+        self._send_lock = Lock('send')
         self._commands = deque()
-        if thread:
-            self.thread = thread(self.loop)
+        # AFTER PASSWORD?
+#        if thread:
+#            self._thread = thread(self.loop)
 
     # This code should be exception safe
     # TODO WHAT TO DO ABOUT PUBSUB ?
     def loop(self):
-        while True:
-            if self.closed:
-                return
-            while self.resolve():
-                pass
+        while self.read():
+            pass
 
     def close(self, e=None):
         self.closed = True
@@ -438,13 +437,21 @@ class Connection(object):
                     asking_cmd = Command((b'ASKING', ))
                     self._commands.append(asking_cmd)
                     self._protocol.write(asking_cmd)
+                    # TODO move this only if sent?
                     cmd._asking = False
                 # pub/sub commands do not expect a result (mark this as one-way connection so others dont try)
                 if cmd.set_resolver(self):
                     # TODO enforce this can't be in one way mode
                     self._commands.append(cmd)
-                # We send after adding to command list to make use of blocking I/O of the other read side
-                self._protocol.write(cmd)
+                    # We send after adding to command list to make use of blocking I/O of the other read side
+                    try:
+                        self._protocol.write(cmd)
+                    except Exception:
+                        # Need to do this while still holding the lock
+                        self._commands.pop()
+                        raise
+                else:
+                    self._protocol.write(cmd)
         # We should only mark the socket for closing when it's dead (and not for example in decoder exception)
         except socket_errors as e:
             self.close()
@@ -458,9 +465,10 @@ class Connection(object):
         if self.closed:
             raise RedisError('Connection closed')
         try:
+            cmd = None
             with self._read_lock:
                 # Double lock safety check
-                if calling_cmd and calling_cmd._got_result:
+                if calling_cmd and (calling_cmd._got_result or calling_cmd._hi):
                     return False
                 first_read = self._protocol.read()
                 try:
@@ -468,6 +476,7 @@ class Connection(object):
                 except IndexError:
                     # This is a one-way connection
                     return first_read
+                cmd._hi = True
                 num_results = cmd.how_many_results()
                 # self._protocol cannot be None here (because of locking)
                 results = [self._protocol.read() for _ in range(num_results - 1)]
@@ -478,12 +487,13 @@ class Connection(object):
             self.close()
             # We should not retry if it's I/O error (it might have already been executed)
             # TODO cmd might not exist ? do a check
-            cmd.set_result(e, dont_retry=True)
+            if cmd:
+                cmd.set_result(e, dont_retry=True)
         return False
 
 
 class Command(object):
-    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue', '_server', '_asking'
+#    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue', '_server', '_asking'
 
     def __init__(self, data, database=None, encoder=None, decoder=None, throw=True, retries=3, enqueue=True, server=None):
         self._data = data
@@ -498,6 +508,7 @@ class Command(object):
         self._got_result = False
         self._result = None
         self._asking = False
+        self._hi = False
 
     def get_number(self):
         return self._database._number if self._database else None
@@ -517,12 +528,14 @@ class Command(object):
         return encode_command(self._data, self._encoder)
 
     def set_resolver(self, connection):
+        self._hi = False
         if self._enqueue:
             self._resolver = connection
         return self._enqueue
 
     def set_result(self, result, dont_retry=False):
         try:
+            self._hi = False
             if not isinstance(result, Exception):
                 result = result[0]
             if self._database and not dont_retry and self._retries and isinstance(result, Exception):
@@ -576,13 +589,60 @@ class Command(object):
             raise RedisError('Command is not finalized yet')
         # This is a loop because of multi threading.
         while not self._got_result:
-            self._resolver.read(self)
+            if thread:
+#                print(1, self)
+#                import time; time.sleep(1)
+                try:
+                    with self._resolver._read_lock:
+                        pass
+                except:
+                    pass
+#                    print(2)
+#                print(3)
+            else:
+                self._resolver.read(self)
         if self._throw and isinstance(self._result, Exception):
             raise self._result
         return self._result
 
 
 class Multiplexer(object):
+    def __init__(self, configuration=None):
+        self._endpoints, self._configuration = parse_uri(configuration)
+        self._connection = None
+        self._lock = Lock('multiplexer')
+        self._scripts = {}
+        self._scripts_sha = {}
+        self._clustered = False
+    
+    def close(self):
+        print(3)
+        if self._connection:
+            with self._lock:
+                if self._connection:
+                    self._connection.close()
+                    self._connection = None
+    
+    def __del__(self):
+        self.close()
+
+    def database(self, number=0, encoder=None, decoder=None, retries=3, server=None):
+        if number != 0 and self._clustered and server is None:
+            raise RedisError('Redis cluster has no database selection support')
+        return Database(self, number, encoder, decoder, retries, server)
+
+    def _send_command(self, cmd):
+#        print(cmd._data)
+        if not self._connection or self._connection.closed:
+            with self._lock:
+                if not self._connection or self._connection.closed:
+                    print(1)
+                    self._connection = Connection.create(self._endpoints[0], self._configuration)
+        print(2)
+        self._connection.send(cmd)
+
+
+class MultiplexerComplex(object):
     __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots'
 
     def __init__(self, configuration=None):
@@ -852,7 +912,7 @@ class Database(object):
 # TODO maybe split the user facing API from the internal Command one (atleast mark it as _)
 # To know the result of a multi command simply resolve any command inside
 class MultiCommand(object):
-    __slots__ = '_database', '_retries', '_server', '_cmds', '_done', '_asking', '_got_result'
+#    __slots__ = '_database', '_retries', '_server', '_cmds', '_done', '_asking', '_got_result'
 
     def __init__(self, database, retries, server):
         self._database = database
@@ -862,6 +922,7 @@ class MultiCommand(object):
         self._done = False
         self._asking = False
         self._got_result = False
+        self._hi = False
 
     def stream(self, chunk_size):
         return chunk_encoded_commands(self._cmds, chunk_size)
@@ -875,6 +936,7 @@ class MultiCommand(object):
         return self._database._number
 
     def set_result(self, result, dont_retry=False):
+        self._hi = False
         # TODO (question) If there is an exec error, maybe preserve the original per-cmd error as well ?
         if isinstance(result, list):
             exec_res = result[-1]
