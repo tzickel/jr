@@ -372,15 +372,9 @@ class Connection(object):
         # Password must be bytes or utf-8 encoded string
         password = configuration.get('password')
         if password is not None:
-            try:
-                cmd = Command((b'AUTH', password))
-                connection.send(cmd)
-                cmd()
-            except Exception as e:
-                connection.close()
-                raise
-        if thread:
-            connection._thread = thread(connection.loop)
+            cmd = Command((b'AUTH', password))
+            connection.send(cmd)
+            cmd()
         return connection
 
     def __init__(self, transport):
@@ -392,9 +386,8 @@ class Connection(object):
         self._read_lock = Lock('read')
         self._send_lock = Lock('send')
         self._commands = deque()
-        # AFTER PASSWORD?
-#        if thread:
-#            self._thread = thread(self.loop)
+        if thread:
+            self._thread = thread(self.loop)
 
     # This code should be exception safe
     # TODO WHAT TO DO ABOUT PUBSUB ?
@@ -402,31 +395,33 @@ class Connection(object):
         while self.read():
             pass
 
-    def close(self, e=None):
+    def close_in_lock(self):
         self.closed = True
         try:
             self._protocol.close()
         except Exception:
             pass
-        finally:
-            with self._read_lock:
-                with self._send_lock:
-                    self._transport = None
-                    self._protocol = None
-                    e = e or RedisError('Connection closed')
-                    for command in self._commands:
-                        # This are already sent and we don't know if they happened or not.
-                        command.set_result(e, dont_retry=True)
-                    self._commands.clear()
+        self._transport = None
+        self._protocol = None
+
+    def close(self, e=None):
+        with self._read_lock:
+            with self._send_lock:
+                e = e or RedisError('Connection closed')
+                for command in self._commands:
+                    # This are already sent and we don't know if they happened or not.
+                    command.set_result(e, dont_retry=True)
+                self._commands.clear()
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
     def send(self, cmd):
-        if self.closed:
-            raise RedisError('Connection closed')
         if cmd._got_result:
             raise RedisError('Command already processed')
-        try:
-            with self._send_lock:
+        should_close = False
+        with self._send_lock:
+            try:
+                if self.closed:
+                    raise RedisError('Connection closed')
                 db_number = cmd.get_number()
                 if db_number is not None and db_number != self._lastdatabase:
                     select_cmd = Command((b'SELECT', db_number))
@@ -452,23 +447,21 @@ class Connection(object):
                         raise
                 else:
                     self._protocol.write(cmd)
-        # We should only mark the socket for closing when it's dead (and not for example in decoder exception)
-        except socket_errors as e:
+            except socket_errors as e:
+                should_close = True
+                self.close_in_lock()
+                cmd.set_result(e, dont_retry=True)
+            except Exception as e:
+                cmd.set_result(e, dont_retry=True)
+        if should_close:
             self.close()
-            # If we could not finish sending over TCP it must have not reached the server?
-            cmd.set_result(e)
-        except Exception as e:
-            # This can happen if for instance decoding the command failed (and it currently happens atomically before sending)
-            cmd.set_result(e, dont_retry=True)
 
     def read(self, calling_cmd=None):
-        if self.closed:
-            raise RedisError('Connection closed')
-        try:
-            cmd = None
-            with self._read_lock:
-                # Double lock safety check
-                if calling_cmd and (calling_cmd._got_result or calling_cmd._hi):
+        should_close = False
+        cmd = None
+        with self._read_lock:
+            try:
+                if calling_cmd and calling_cmd._got_result:
                     return False
                 first_read = self._protocol.read()
                 try:
@@ -476,20 +469,18 @@ class Connection(object):
                 except IndexError:
                     # This is a one-way connection
                     return first_read
-                cmd._hi = True
                 num_results = cmd.how_many_results()
                 # self._protocol cannot be None here (because of locking)
                 results = [self._protocol.read() for _ in range(num_results - 1)]
                 results.insert(0, first_read)
-            cmd.set_result(results)
-            return True
-        except Exception as e:
+                cmd.set_result(results)#, dont_retry=True)
+            except Exception as e:
+                should_close = True
+                self.close_in_lock()
+                if cmd:
+                    cmd.set_result(e, dont_retry=True)
+        if should_close:
             self.close()
-            # We should not retry if it's I/O error (it might have already been executed)
-            # TODO cmd might not exist ? do a check
-            if cmd:
-                cmd.set_result(e, dont_retry=True)
-        return False
 
 
 class Command(object):
@@ -508,7 +499,6 @@ class Command(object):
         self._got_result = False
         self._result = None
         self._asking = False
-        self._hi = False
 
     def get_number(self):
         return self._database._number if self._database else None
@@ -528,14 +518,12 @@ class Command(object):
         return encode_command(self._data, self._encoder)
 
     def set_resolver(self, connection):
-        self._hi = False
         if self._enqueue:
             self._resolver = connection
         return self._enqueue
 
     def set_result(self, result, dont_retry=False):
         try:
-            self._hi = False
             if not isinstance(result, Exception):
                 result = result[0]
             if self._database and not dont_retry and self._retries and isinstance(result, Exception):
@@ -589,17 +577,18 @@ class Command(object):
             raise RedisError('Command is not finalized yet')
         # This is a loop because of multi threading.
         while not self._got_result:
-            if thread:
+#            if thread:
 #                print(1, self)
 #                import time; time.sleep(1)
-                try:
-                    with self._resolver._read_lock:
-                        pass
-                except:
-                    pass
+#                try:
+#                    with self._resolver._read_lock:
+#                        pass
+#                except:
+#                    pass
 #                    print(2)
 #                print(3)
-            else:
+#                self._resolver.read(self)
+#            else:
                 self._resolver.read(self)
         if self._throw and isinstance(self._result, Exception):
             raise self._result
@@ -922,7 +911,6 @@ class MultiCommand(object):
         self._done = False
         self._asking = False
         self._got_result = False
-        self._hi = False
 
     def stream(self, chunk_size):
         return chunk_encoded_commands(self._cmds, chunk_size)
@@ -936,7 +924,6 @@ class MultiCommand(object):
         return self._database._number
 
     def set_result(self, result, dont_retry=False):
-        self._hi = False
         # TODO (question) If there is an exec error, maybe preserve the original per-cmd error as well ?
         if isinstance(result, list):
             exec_res = result[-1]
