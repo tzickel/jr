@@ -354,7 +354,7 @@ class Protocol(object):
 # TODO add ony_way (if no commands in list, put it in some result list ?)
 # TODO what is retry connect strategy ?
 class Connection(object):
-#    __slots__ = '_transport', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
+    __slots__ = '_transport', '_protocol', 'name', 'closed', '_lastdatabase', '_read_lock', '_send_lock', '_commands', '_thread'
 
     @classmethod
     def create(cls, endpoint, configuration):
