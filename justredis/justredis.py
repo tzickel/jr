@@ -372,9 +372,13 @@ class Connection(object):
         # Password must be bytes or utf-8 encoded string
         password = configuration.get('password')
         if password is not None:
-            cmd = Command((b'AUTH', password))
-            connection.send(cmd)
-            cmd()
+            try:
+                cmd = Command((b'AUTH', password))
+                connection.send(cmd)
+                cmd()
+            except:
+                connection.close()
+                raise
         return connection
 
     def __init__(self, transport):
@@ -383,8 +387,8 @@ class Connection(object):
         self.name = transport.name
         self.closed = False
         self._lastdatabase = 0
-        self._read_lock = Lock('read')
-        self._send_lock = Lock('send')
+        self._read_lock = Lock()
+        self._send_lock = Lock()
         self._commands = deque()
         if thread:
             self._thread = thread(self.loop)
@@ -405,6 +409,8 @@ class Connection(object):
         self._protocol = None
 
     def close(self, e=None):
+        # This is called if called from the outside
+        self.close_in_lock()
         with self._read_lock:
             with self._send_lock:
                 e = e or RedisError('Connection closed')
@@ -577,19 +583,7 @@ class Command(object):
             raise RedisError('Command is not finalized yet')
         # This is a loop because of multi threading.
         while not self._got_result:
-#            if thread:
-#                print(1, self)
-#                import time; time.sleep(1)
-#                try:
-#                    with self._resolver._read_lock:
-#                        pass
-#                except:
-#                    pass
-#                    print(2)
-#                print(3)
-#                self._resolver.read(self)
-#            else:
-                self._resolver.read(self)
+            self._resolver.read(self)
         if self._throw and isinstance(self._result, Exception):
             raise self._result
         return self._result
@@ -599,13 +593,12 @@ class Multiplexer(object):
     def __init__(self, configuration=None):
         self._endpoints, self._configuration = parse_uri(configuration)
         self._connection = None
-        self._lock = Lock('multiplexer')
+        self._lock = Lock()
         self._scripts = {}
         self._scripts_sha = {}
         self._clustered = False
     
     def close(self):
-        print(3)
         if self._connection:
             with self._lock:
                 if self._connection:
@@ -621,13 +614,10 @@ class Multiplexer(object):
         return Database(self, number, encoder, decoder, retries, server)
 
     def _send_command(self, cmd):
-#        print(cmd._data)
         if not self._connection or self._connection.closed:
             with self._lock:
                 if not self._connection or self._connection.closed:
-                    print(1)
                     self._connection = Connection.create(self._endpoints[0], self._configuration)
-        print(2)
         self._connection.send(cmd)
 
 

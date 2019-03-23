@@ -52,39 +52,9 @@ def builtin_with_threads():
         t.start()
         return t
 
-    class NewLock(object):
-        def __init__(self, name=None):
-            self.name = name
-            self.lock = Lock()
-
-        def __enter__(self):
-            print('enter', self.name, self)
-            return self.lock.__enter__()
-        
-        def __exit__(self, *args):
-            print('exit', self.name, self)
-            return self.lock.__exit__(*args)
-
-    from inspect import currentframe, getframeinfo
-    import sys
-    class NewLock(object):
-        def __init__(self, name=None):
-            self.name = name
-            self.lock = Lock()
-
-        def __enter__(self):
-            #frameinfo = getframeinfo(currentframe().f_back)
-            #sys.stderr.write('%s, %s, %s, %s, %s\n' % (id(self), self.name, 'enter', frameinfo.filename, frameinfo.lineno))
-            return self.lock.__enter__()
-        
-        def __exit__(self, *args):
-            #frameinfo = getframeinfo(currentframe().f_back)
-            #sys.stderr.write('%s, %s, %s, %s, %s\n' % (id(self), self.name, 'exit', frameinfo.filename, frameinfo.lineno))
-            return self.lock.__exit__(*args)
-
     env = {}
     env["socket"] = socket
-    env["Lock"] = NewLock
+    env["Lock"] = Lock
     env["Event"] = Event
     env["select"] = select
     env["thread"] = thread
