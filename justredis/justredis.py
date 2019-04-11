@@ -53,6 +53,7 @@ except NameError:
 socket_errors = (IOError, OSError, socket.error, socket.timeout)
 
 
+# Platform selection for TCP keepalive settings
 platform = ''
 if sys.platform.startswith('linux'):
     platform = 'linux'
@@ -97,6 +98,7 @@ def bytes_as_strings(encoding='utf-8', errors='strict'):
 
 utf8_bytes_as_strings = bytes_as_strings()
 
+
 # Redis protocol encoder / decoder
 def encode_command(data, encoder):
     output = [b'*', encode_number(len(data)), b'\r\n']
@@ -107,6 +109,9 @@ def encode_command(data, encoder):
 
 
 def chunk_encoded_command(cmd, chunk_size):
+    """
+    Encode an iterable to a redis bulk reply
+    """
     data = []
     data_len = 0
     for x in cmd.encode():
@@ -128,6 +133,9 @@ def chunk_encoded_command(cmd, chunk_size):
 
 
 def chunk_encoded_commands(cmds, chunk_size):
+    """
+    Encode an iterable of iterables to multiple redis bulk reply
+    """
     data = []
     data_len = 0
     cmd_index = 0
@@ -258,6 +266,7 @@ class Transport(object):
         res = select([self._socket], [], [], timeout)
         return True if res[0] else False
 
+    @property
     def name(self):
         res = self._socket.getpeername()
         if self._socket.family == socket.AF_INET6:
@@ -351,8 +360,6 @@ class Protocol(object):
         self._parser = None
 
 
-# TODO add ony_way (if no commands in list, put it in some result list ?)
-# TODO what is retry connect strategy ?
 class Connection(object):
     __slots__ = '_transport', '_protocol', 'name', 'closed', '_lastdatabase', '_read_lock', '_send_lock', '_commands', '_thread'
 
@@ -396,6 +403,7 @@ class Connection(object):
     # This code should be exception safe
     # TODO WHAT TO DO ABOUT PUBSUB ?
     def loop(self):
+        print(11)
         while self.read():
             pass
 
@@ -456,20 +464,23 @@ class Connection(object):
             except socket_errors as e:
                 should_close = True
                 self.close_in_lock()
-                cmd.set_result(e, dont_retry=True)
+                cmd.set_result(e)
             except Exception as e:
                 cmd.set_result(e, dont_retry=True)
         if should_close:
             self.close()
 
     def read(self, calling_cmd=None):
-        should_close = False
+#        should_close = False
         cmd = None
+        print(1)
         with self._read_lock:
             try:
-                if calling_cmd and calling_cmd._got_result:
+                if calling_cmd and (calling_cmd._got_result or calling_cmd._resolver != self):
                     return False
+                print(2)
                 first_read = self._protocol.read()
+                print(3, first_read)
                 try:
                     cmd = self._commands.popleft()
                 except IndexError:
@@ -479,18 +490,20 @@ class Connection(object):
                 # self._protocol cannot be None here (because of locking)
                 results = [self._protocol.read() for _ in range(num_results - 1)]
                 results.insert(0, first_read)
-                cmd.set_result(results)#, dont_retry=True)
+                cmd.set_result(results)
+                return True
             except Exception as e:
-                should_close = True
+#                should_close = True
                 self.close_in_lock()
                 if cmd:
                     cmd.set_result(e, dont_retry=True)
-        if should_close:
-            self.close()
+#        if should_close:
+        self.close()
+        return False
 
 
 class Command(object):
-#    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue', '_server', '_asking'
+    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue', '_server', '_asking'
 
     def __init__(self, data, database=None, encoder=None, decoder=None, throw=True, retries=3, enqueue=True, server=None):
         self._data = data
@@ -528,6 +541,7 @@ class Command(object):
             self._resolver = connection
         return self._enqueue
 
+    #TODO make sure I cant recursive locks here especially in connection on retry !
     def set_result(self, result, dont_retry=False):
         try:
             if not isinstance(result, Exception):
@@ -583,6 +597,7 @@ class Command(object):
             raise RedisError('Command is not finalized yet')
         # This is a loop because of multi threading.
         while not self._got_result:
+            print(22)
             self._resolver.read(self)
         if self._throw and isinstance(self._result, Exception):
             raise self._result
@@ -590,38 +605,6 @@ class Command(object):
 
 
 class Multiplexer(object):
-    def __init__(self, configuration=None):
-        self._endpoints, self._configuration = parse_uri(configuration)
-        self._connection = None
-        self._lock = Lock()
-        self._scripts = {}
-        self._scripts_sha = {}
-        self._clustered = False
-    
-    def close(self):
-        if self._connection:
-            with self._lock:
-                if self._connection:
-                    self._connection.close()
-                    self._connection = None
-    
-    def __del__(self):
-        self.close()
-
-    def database(self, number=0, encoder=None, decoder=None, retries=3, server=None):
-        if number != 0 and self._clustered and server is None:
-            raise RedisError('Redis cluster has no database selection support')
-        return Database(self, number, encoder, decoder, retries, server)
-
-    def _send_command(self, cmd):
-        if not self._connection or self._connection.closed:
-            with self._lock:
-                if not self._connection or self._connection.closed:
-                    self._connection = Connection.create(self._endpoints[0], self._configuration)
-        self._connection.send(cmd)
-
-
-class MultiplexerComplex(object):
     __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots'
 
     def __init__(self, configuration=None):
@@ -637,9 +620,6 @@ class MultiplexerComplex(object):
         self._command_cache = {}
         self._already_asking_for_slots = False
         self._slots = []
-#        for endpoint in self._endpoints:
-#            # Since we don't actually connect here, the endpoint name might be different but we don't care
-#            self._connections[endpoint] = Connection(endpoint, self._configuration)
 
     # TODO have a closed flag, and stop requesting new connections? (no, it should be reusable?)
     def close(self):
