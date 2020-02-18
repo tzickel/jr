@@ -1,4 +1,5 @@
-from __future__ import absolute_import
+from asyncio import Lock, Event, open_connection, open_unix_connection
+import socket
 import sys
 from collections import deque
 from hashlib import sha1
@@ -8,9 +9,7 @@ from binascii import crc_hqx
 import hiredis
 
 
-# Execution environment
-from .environment import get_env
-Lock, Event, socket, select, thread = get_env("Lock", "Event", "socket", "select", "thread")
+# TODO are asyncio locks reantrent ?
 
 
 # Exceptions
@@ -24,29 +23,11 @@ class RedisError(Exception):
     pass
 
 
-# Python 2/3 compatability
-if isinstance(str(1), bytes):
-    def encode_number(number):
-        return str(number)
-else:
-    def encode_number(number):
-        return str(number).encode()
+def encode_number(number):
+    return str(number).encode()
 
 
-try:
-    long
-except NameError:
-    long = int
-try:
-    unicode
-except NameError:
-    unicode = str
-
-
-try:
-    connect_errors = (ConnectionError, socket.error, socket.timeout)
-except NameError:
-    connect_errors = (socket.error, socket.timeout)
+connect_errors = (ConnectionError, socket.error, socket.timeout)
 
 
 # TODO (question) Am I missing an exception type here ?
@@ -71,11 +52,11 @@ def encode(encoding='utf-8', errors='strict'):
     def encode_with_encoding(inp, encoding=encoding, errors=errors):
         if isinstance(inp, bytes):
             return inp
-        elif isinstance(inp, unicode):
+        elif isinstance(inp, str):
             return inp.encode(encoding, errors)
         elif isinstance(inp, bool):
             raise ValueError('Invalid input for encoding')
-        elif isinstance(inp, (int, long)):
+        elif isinstance(inp, int):
             return str(inp).encode()
         elif isinstance(inp, float):
             return repr(inp).encode()
@@ -234,15 +215,24 @@ def parse_command(source, *args, **kwargs):
     return Command(args, source, encoder, decoder, throw, retries, True, server)
 
 
+async def async_with_timeout(fut, timeout=None):
+    if timeout is None:
+        return await fut
+    else:
+        return await asyncio.wait_for(fut, timeout=timeout)
+
+
 class Connection(object):
-    __slots__ = 'socket', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'buffer', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
+    __slots__ = 'reader', 'writer', 'buffersize', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'buffer', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
 
     @classmethod
-    def create(cls, endpoint, config, with_thread=True):
+    async def create(cls, endpoint, config):
         connectionhandler = config.get('connectionhandler', cls)
-        return connectionhandler(endpoint, config, with_thread)
+        connection = connectionhandler()
+        await connection._init(endpoint, config)
+        return connection
 
-    def __init__(self, endpoint, config, with_thread):
+    async def _init(self, endpoint, config):
         connecttimeout = config.get('connecttimeout', socket.getdefaulttimeout())
         connectretry = config.get('connectretry', 0) + 1
         sockettimeout = config.get('sockettimeout', socket.getdefaulttimeout())
@@ -252,14 +242,18 @@ class Connection(object):
         while connectretry:
             try:
                 if isinstance(endpoint, str):
-                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    sock.settimeout(connecttimeout)
-                    sock.connect(endpoint)
-                    sock.settimeout(sockettimeout)
-                    self.socket = sock
+                    # TODO (async) fix
+                    raise NotImplementedError()
+                    #sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    #sock.settimeout(connecttimeout)
+                    #sock.connect(endpoint)
+                    #sock.settimeout(sockettimeout)
+                    #self.socket = sock
                 elif isinstance(endpoint, tuple):
-                    self.socket = socket.create_connection(endpoint, timeout=connecttimeout)
-                    self.socket.settimeout(sockettimeout)
+                    connection = await async_with_timeout(open_connection(host=endpoint[0], port=endpoint[1], limit=buffersize), connecttimeout)
+                    self.reader, self.writer = connection
+                    self.buffersize = buffersize
+                    # TODO (async) setup timeout
                 else:
                     raise RedisError('Invalid endpoint')
                 break
@@ -268,11 +262,14 @@ class Connection(object):
                 if not connectretry:
                     raise RedisError('Connection failed: %r' % e)
         # needed for cluster support
-        self.name = self.socket.getpeername()
-        if self.socket.family == socket.AF_INET6:
-            self.name = self.name[:2]
+        self.name = self.writer.get_extra_info('peername')
+        #self.name = self.socket.getpeername()
+        # TODO (async) fix
+        #if self.socket.family == socket.AF_INET6:
+            #self.name = self.name[:2]
         # TCP connection settings
-        if isinstance(self.socket.getsockname(), tuple):
+        # TODO (async) fix settings
+        if False: #isinstance(self.socket.getsockname(), tuple):
             if tcpnodelay:
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             if tcpkeepalive:
@@ -290,23 +287,24 @@ class Connection(object):
         self.read_lock = Lock()
         self.send_lock = Lock()
         self.chunk_send_size = 6000
-        self.buffer = bytearray(buffersize)
+        #self.buffer = bytearray(buffersize)
         self.parser = hiredis_parser()
         self.parser.send(None)
         self.lastdatabase = 0
-        self.thread_event = None
-        if with_thread and thread:
-            self.thread_event = Event()
-            self.thread = thread(self.loop)
+        # TODO (async) implment
+        #self.thread_event = None
+        #if with_thread and thread:
+            #self.thread_event = Event()
+            #self.thread = thread(self.loop)
         # Password must be bytes or utf-8 encoded string
         password = config.get('password')
         if password is not None:
             cmd = Command((b'AUTH', password))
             try:
-                self.send(cmd)
-                cmd()
+                await self.send(cmd)
+                await cmd()
             except Exception:
-                self.close()
+                await self.close()
                 raise
 
     # This code should be exception safe
@@ -324,92 +322,109 @@ class Connection(object):
     def close_write(self):
         self.closed = True
 
-    def close(self):
+    async def close(self):
         self.closed = True
         try:
-            self.socket.close()
+            self.writer.close()
+            await self.writer.wait_closed()
+        except Exception:
+            pass
+        try:
+            self.reader.close()
+            await self.reader.wait_close()
         except Exception:
             pass
         finally:
-            self.socket = None
+            self.writer = None
+            self.reader = None
             if self.commands:
                 # Hmmm... I think there is no threading issue here with regards to other uses of read/send locks in the code ?
-                with self.read_lock:
-                    with self.send_lock:
+                async with self.read_lock:
+                    async with self.send_lock:
                         for command in self.commands:
                             # This are already sent and we don't know if they happened or not.
-                            command.set_result(RedisError('Connection closed'), dont_retry=True)
+                            await command.set_result(RedisError('Connection closed'), dont_retry=True)
                         self.commands = []
-            if self.thread_event:
-                self.thread_event.set()
+            # TODO (async)
+            #if self.thread_event:
+                #self.thread_event.set()
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
-    def send(self, cmd):
+    async def send(self, cmd):
         try:
-            with self.send_lock:
+            async with self.send_lock:
                 db_number = cmd.get_number()
                 if db_number is not None and db_number != self.lastdatabase:
                     select_cmd = Command((b'SELECT', db_number))
                     for x in select_cmd.stream(self.chunk_send_size):
-                        self.socket.sendall(x)
+                        self.writer.write(x)
+                        # TODO (async) should I drain ?
                     self.commands.append(select_cmd)
                     self.lastdatabase = db_number
                 if cmd._asking:
                     asking_cmd = Command((b'ASKING', ))
                     for x in asking_cmd.stream(self.chunk_send_size):
-                        self.socket.sendall(x)
+                        self.writer.write(x)
                     cmd._asking = False
                     self.commands.append(asking_cmd)
                 # We send before we append to commands list because another thread might do resolve, and this will race
                 for x in cmd.stream(self.chunk_send_size):
-                    self.socket.sendall(x)
+                    self.writer.write(x)
+                    await self.writer.drain()
                 # pub/sub commands do not expect a result
                 if cmd.set_resolver(self):
                     self.commands.append(cmd)
-                if self.thread_event:
-                    self.thread_event.set()
+                # TODO (async)
+                # if self.thread_event:
+                    #self.thread_event.set()
         # We should only mark the socket for closing when it's dead (and not for example in decoder exception)
         except socket_errors as e:
             self.close_write()
-            cmd.set_result(e)
+            await cmd.set_result(e)
         except Exception as e:
-            cmd.set_result(e)
+            await cmd.set_result(e)
 
-    def resolve(self, cmd=None):
+    async def resolve(self, cmd=None):
         try:
-            with self.read_lock:
+            async with self.read_lock:
                 # Double lock safety check
                 if cmd and cmd._got_result:
                     return False
                 cmd = self.commands.popleft()
                 num_results = cmd.how_many_results()
-                results = [self.recv() for _ in range(num_results)]
-            cmd.set_result(results)
+                results = [await self.recv() for _ in range(num_results)]
+            await cmd.set_result(results)
             return True
         except IndexError:
             pass
         except Exception as e:
-            self.close()
+            await self.close()
             # We should not retry if it/s I/O error (it might have already been executed)
-            cmd.set_result(e, dont_retry=True)
+            await cmd.set_result(e, dont_retry=True)
             # We don't raise here, because it makes no sense ?
         return False
 
-    def recv(self, allow_empty=False):
+    async def recv(self, allow_empty=False):
         try:
             res = self.parser.send(None)
             while res is False:
                 if allow_empty:
                     return res
-                length = self.socket.recv_into(self.buffer)
-                if length == 0:
+                # TODO (async)
+                #length = self.socket.recv_into(self.buffer)
+                #if length == 0:
+                    #raise RedisError('Connection closed')
+                #res = self.parser.send((self.buffer, 0, length))
+                buffer = await self.reader.read(self.buffersize)
+                if not buffer:
                     raise RedisError('Connection closed')
-                res = self.parser.send((self.buffer, 0, length))
+                res = self.parser.send((buffer, 0, len(buffer)))
             return res
         except Exception:
-            self.close()
+            await self.close()
             raise
 
+    # TODO (async) fix
     def wait(self, timeout):
         res = select([self.socket], [], [], timeout)
         if not res[0]:
@@ -456,7 +471,7 @@ class Command(object):
             self._resolver = connection
         return self._enqueue
 
-    def set_result(self, result, dont_retry=False):
+    async def set_result(self, result, dont_retry=False):
         try:
             if not isinstance(result, Exception):
                 result = result[0]
@@ -464,7 +479,7 @@ class Command(object):
                 self._retries -= 1
                 # We will only retry if it's a network I/O or some redis logic
                 if isinstance(result, socket_errors):
-                    self._database._multiplexer._send_command(self)
+                    await self._database._multiplexer._send_command(self)
                     return
                 elif isinstance(result, RedisReplyError):
                     # hiredis exceptions are already encoded....
@@ -473,16 +488,16 @@ class Command(object):
                         script = self._database._scripts_sha.get(sha)
                         if script:
                             self._data = (b'EVAL', script) + self._data[2:]
-                            self._database._multiplexer._send_command(self)
+                            await self._database._multiplexer._send_command(self)
                             return
                     elif result.args[0].startswith('MOVED'):
                         _, hashslot, addr = result.args[0].split(' ')
                         hashslot = int(hashslot)
                         addr = addr.rsplit(':', 1)
                         addr = (addr[0], int(addr[1]))
-                        self._database._multiplexer._update_slots(moved_hint=(hashslot, addr))
+                        await self._database._multiplexer._update_slots(moved_hint=(hashslot, addr))
                         self._server = addr
-                        self._database._multiplexer._send_command(self)
+                        await self._database._multiplexer._send_command(self)
                         return
                     elif result.args[0].startswith('ASKING'):
                         _, hashslot, addr = result.args[0].split(' ')
@@ -491,7 +506,7 @@ class Command(object):
                         addr = (addr[0], int(addr[1]))
                         self._asking = True
                         self._server = addr
-                        self._database._multiplexer._send_command(self)
+                        await self._database._multiplexer._send_command(self)
                         return
             # TODO should we call decoder on Exceptions as well ?
             self._result = result if not self._decoder else self._decoder(result)
@@ -506,12 +521,12 @@ class Command(object):
             self._database = None
             self._resolver = None
 
-    def __call__(self):
+    async def __call__(self):
         if not self._got_result and not self._resolver:
             raise RedisError('Command is not finalized yet')
         # This is a loop because of multi threading.
         while not self._got_result:
-            self._resolver.resolve(self)
+            await self._resolver.resolve(self)
         if self._throw and isinstance(self._result, Exception):
             raise self._result
         return self._result
@@ -536,19 +551,19 @@ class Multiplexer(object):
         self._slots = []
 
     # TODO have a closed flag, and stop requesting new connections?
-    def close(self):
-        with self._lock:
+    async def close(self):
+        async with self._lock:
             try:
                 for connection in self._connections.values():
-                    connection.close()
+                    await connection.close()
             except Exception:
                 pass
             self._connections = {}
             self._last_connection = None
 
     # TODO (question) is this sane or we should not support this (explicitly call close?)
-    def __del__(self):
-        self.close()
+    #async def __del__(self):
+        #await self.close()
 
     def database(self, number=0, encoder=None, decoder=None, retries=3, server=None):
         if number != 0 and self._clustered and server is None:
@@ -556,6 +571,7 @@ class Multiplexer(object):
         return Database(self, number, encoder, decoder, retries, server)
 
     # TODO support optional server instance for pub/sub ? (for keyspace notification at least)
+    # TODO (async)
     def pubsub(self, encoder=None, decoder=None):
         if self._pubsub is None:
             with self._lock:
@@ -563,27 +579,27 @@ class Multiplexer(object):
                     self._pubsub = PubSub(self)
         return PubSubInstance(self._pubsub, encoder, decoder)
 
-    def endpoints(self):
+    async def endpoints(self):
         if self._clustered is None:
-            self._get_connection()
+            await self._get_connection()
         # TODO is this atomic ?
         if self._clustered:
             return [x[1] for x in list(self._slots)]
         else:
             return list(self._connections.keys())
 
-    def run_commandreply_on_all_masters(self, *args, **kwargs):
+    async def run_commandreply_on_all_masters(self, *args, **kwargs):
         if self._clustered is False:
             raise RedisError('This command only runs on cluster mode')
         res = {}
         for endpoint in self.endpoints():
-            res[endpoint] = self.database(server=endpoint).commandreply(*args, **kwargs)
+            res[endpoint] = await self.database(server=endpoint).commandreply(*args, **kwargs)
         return res
 
-    def _get_connection(self, hashslot=None):
+    async def _get_connection(self, hashslot=None):
         if not hashslot:
             if self._last_connection is None or self._last_connection.closed:
-                with self._lock:
+                async with self._lock:
                     if self._last_connection is None or self._last_connection.closed:
                         # TODO should we enumerate self._uri or self.connections (which is not populated, maybe populate at start and avoid cluster problems)
                         for num, addr in enumerate(list(self._endpoints)):
@@ -591,18 +607,18 @@ class Multiplexer(object):
                             try:
                                 conn = self._connections.get(addr)
                                 if not conn or conn.closed:
-                                    conn = Connection.create(addr, self._configuration)
+                                    conn = await Connection.create(addr, self._configuration)
                                     # TODO is the name correct here? (in ipv4 yes, in ipv6 no ?)
                                     self._last_connection = self._connections[conn.name] = conn
                                     self._last_connection = conn
                                     # TODO reset each time?
                                     if self._clustered is None:
-                                        self._update_slots(with_connection=conn)
+                                        await self._update_slots(with_connection=conn)
                                     return conn
                             except Exception as e:
                                 exp = e
                                 try:
-                                    conn.close()
+                                    await conn.close()
                                 except:
                                     pass
                                 self._connections.pop(addr, None)
@@ -611,7 +627,7 @@ class Multiplexer(object):
             return self._last_connection
         else:
             if not self._slots:
-                self._update_slots()
+                await self._update_slots()
             for slot in self._slots:
                 if hashslot > slot[0]:
                     continue
@@ -621,47 +637,47 @@ class Multiplexer(object):
                 conn = self._connections.get(addr)
                 if not conn or conn.closed:
                     #TODO lock per conn
-                    with self._lock:
+                    async with self._lock:
                         conn = self._connections.get(addr)
                         if not conn or conn.closed:
-                            conn = Connection.create(addr, self._configuration)
+                            conn = await Connection.create(addr, self._configuration)
                             self._connections[addr] = conn
                 return conn
             # TODO (misc) should we try getting another connection here ?
             except Exception:
-                self._update_slots()
+                await self._update_slots()
                 raise
 
     # TODO check if closed and dont allow
-    def _send_command(self, cmd):
+    async def _send_command(self, cmd):
         server = cmd._server
         if not server:
             if isinstance(cmd, MultiCommand) and self._clustered is not False:
                 for acmd in cmd._cmds[1:-1]:
-                    hashslot = self._get_command_from_cache(acmd)
+                    hashslot = await self._get_command_from_cache(acmd)
                     if hashslot is not None:
                         break
             else:
-                hashslot = self._get_command_from_cache(cmd)
-            connection = self._get_connection(hashslot)
+                hashslot = await self._get_command_from_cache(cmd)
+            connection = await self._get_connection(hashslot)
         else:
             try:
                 conn = self._connections.get(server)
                 if not conn or conn.closed:
                     #TODO lock per conn
-                    with self._lock:
+                    async with self._lock:
                         conn = self._connections.get(server)
                         if not conn or conn.closed:
-                            conn = Connection.create(server, self._configuration)
+                            conn = await Connection.create(server, self._configuration)
                             self._connections[server] = conn
                 connection = conn
             # TODO (misc) should we try getting another connection here ?
             except Exception:
-                self._update_slots()
+                await self._update_slots()
                 raise
-        connection.send(cmd)
+        await connection.send(cmd)
 
-    def _update_slots(self, moved_hint=None, with_connection=None):
+    async def _update_slots(self, moved_hint=None, with_connection=None):
         if self._clustered is False:
             return
         if self._already_asking_for_slots:
@@ -682,10 +698,10 @@ class Multiplexer(object):
             # TODO should we retry on some type of errors ?
             cmd = Command((b'CLUSTER', b'SLOTS'))
             # TODO with_connection should be forced ?
-            connection = with_connection or self._get_connection()
-            connection.send(cmd)
+            connection = with_connection or await self._get_connection()
+            await connection.send(cmd)
             try:
-                slots = cmd()
+                slots = await cmd()
                 self._clustered = True
             except RedisReplyError:
                 slots = []
@@ -697,7 +713,7 @@ class Multiplexer(object):
             for entry in remove_connections:
                 try:
                     connections = self._connections.pop(entry)
-                    connections.close()
+                    await connections.close()
                 except Exception:
                     pass
             self._slots = slots
@@ -706,7 +722,7 @@ class Multiplexer(object):
 
     # It is unreasonable to expect the user to provide us with the key index for each command so we ask the server and cache it
     # TODO what to do in MULTI case ? maybe this should be in Command itself
-    def _get_command_from_cache(self, cmd):
+    async def _get_command_from_cache(self, cmd):
         if self._clustered is False:
             return None
         command_name = cmd.get_index_as_bytes(0)
@@ -716,11 +732,11 @@ class Multiplexer(object):
             # allow retries? might be infinite loop...
             info_cmd = Command((b'COMMAND', b'INFO', command_name))
             # If connection is dead, then the initiator command should retry
-            self._get_connection().send(info_cmd)
+            await (await self._get_connection()).send(info_cmd)
             # We do this check here, since _get_connection first try will trigger a clustred check and we need to abort if it's not (to not trigger the send_command's hashslot)
             if self._clustered is False:
                 return None
-            cmdinfo = info_cmd()[0]
+            cmdinfo = (await info_cmd())[0]
             # If the server does not know the command, we can't redirect it properly in cluster mode
             keyindex = cmdinfo[3] if cmdinfo else 0
             self._command_cache[command_name] = keyindex
@@ -746,14 +762,15 @@ class Database(object):
         self._scripts = multiplexer._scripts
         self._scripts_sha = multiplexer._scripts_sha
 
-    def command(self, *args, **kwargs):
+    async def command(self, *args, **kwargs):
         cmd = parse_command(self, *args, **kwargs)
-        self._multiplexer._send_command(cmd)
+        await self._multiplexer._send_command(cmd)
         return cmd
 
-    def commandreply(self, *args, **kwargs):
-        return self.command(*args, **kwargs)()
+    async def commandreply(self, *args, **kwargs):
+        return await self.command(*args, **kwargs)()
 
+    # TODO (async) implment
     def multi(self, retries=None):
         return MultiCommand(self, retries if retries is not None else self._retries, server=self._server)
 
@@ -1067,11 +1084,11 @@ class PubSubInstance(object):
         if self._closed:
             raise RedisError('Pub/sub instance closed')
         if channels:
-            if isinstance(channels, (unicode, str, bytes)):
+            if isinstance(channels, (str, bytes)):
                 channels = [channels]
             channels = [self._encoder(x) for x in channels]
         if patterns:
-            if isinstance(patterns, (unicode, str, bytes)):
+            if isinstance(patterns, (str, bytes)):
                 patterns = [patterns]
             patterns = [self._encoder(x) for x in patterns]
         cmd(self, channels, patterns)

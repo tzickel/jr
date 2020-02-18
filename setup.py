@@ -1,13 +1,17 @@
 #!/usr/bin/env python
 from setuptools import setup
 
-from justredis import __version__
+with open('justredis/__init__.py') as f:
+    for line in f:
+        if line.startswith('__version__'):
+            version = line.strip().split('\'')[-2]
 
 setup(
     name='justredis',
-    version=__version__,
+    version=version,
     packages=['justredis'],
-    python_requires=">=2.7",
+    # TODO which version ?
+    python_requires=">=3.7",
     install_requires=['hiredis>=0.1.3'],
     test_suite="tests"
 )

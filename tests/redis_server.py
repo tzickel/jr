@@ -1,5 +1,17 @@
 import subprocess
 import random
+import sys
+import os
+import signal
+
+
+platform = ''
+if sys.platform.startswith('linux'):
+    platform = 'linux'
+elif sys.platform.startswith('darwin'):
+    platform = 'darwin'
+elif sys.platform.startswith('win'):
+    platform = 'windows'
 
 
 def start_cluster(masters, dockerimage=None, extraparams='', ipv4=True):
@@ -23,7 +35,10 @@ class RedisServer(object):
                 cmd = 'docker run --rm -p {port}:6379 {image} --save {extraparams}'.format(port=self.port, image=dockerimage, extraparams=extraparams)
             else:
                 cmd = 'redis-server --save --port {port} {extraparams}'.format(port=self.port, extraparams=extraparams)
-            self._proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            kwargs = {}
+            if platform == 'linux':
+                kwargs['preexec_fn'] = os.setsid
+            self._proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
             seen_redis = False
             while True:
                 line = self._proc.stdout.readline()
@@ -50,7 +65,10 @@ class RedisServer(object):
         if self._proc:
             try:
                 self._proc.stdout.close()
-                self._proc.kill()
+                if platform == 'linux':
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM) 
+                else:
+                    self._proc.kill()
                 self._proc.wait()
             except Exception:
                 pass
