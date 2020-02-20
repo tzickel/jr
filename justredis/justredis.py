@@ -1,4 +1,4 @@
-from asyncio import Lock, Event, open_connection, open_unix_connection, get_running_loop
+from asyncio import Lock, Event, open_connection, open_unix_connection, create_task
 import socket
 import sys
 from collections import deque
@@ -10,7 +10,7 @@ import hiredis
 
 
 # TODO are asyncio locks reantrent ?
-
+# TODO (async) make the per command event, a pool and reuse them...
 
 # Exceptions
 # An error response from the redis server
@@ -225,7 +225,7 @@ async def async_with_timeout(fut, timeout=None):
 
 class Connection(object):
     # TODO (async) update all __slots__ in all places
-    __slots__ = 'reader', 'writer', 'buffersize', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'buffer', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
+#    __slots__ = 'reader', 'writer', 'buffersize', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'buffer', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
 
     @classmethod
     async def create(cls, endpoint, config):
@@ -292,13 +292,8 @@ class Connection(object):
         self.parser = hiredis_parser()
         self.parser.send(None)
         self.lastdatabase = 0
-        # TODO (async) implment
-        self.thread_event = Event()
-        self.thread = get_running_loop().call_soon(self.loop)
-        #self.thread_event = None
-        #if with_thread and thread:
-            #self.thread_event = Event()
-            #self.thread = thread(self.loop)
+        # TODO (async) use ensure_future instead ?
+        self.thread = create_task(self.loop())
         # Password must be bytes or utf-8 encoded string
         password = config.get('password')
         if password is not None:
@@ -310,16 +305,26 @@ class Connection(object):
                 await self.close()
                 raise
 
-    # This code should be exception safe
+    # TODO (handle multicommand how_many_results....)
     async def loop(self):
-        while True:
-            # TODO is this meh ?
-            await self.thread_event.wait()
-            self.thread_event.clear()
-            if self.closed:
-                return
-            while self.resolve():
-                pass
+        try:
+            while True:
+                cmd = None
+                result = [await self.recv()]
+                # TODO on close this could abort, maybe get the recv lock ?
+                cmd = self.commands.popleft()
+                num_results = cmd.how_many_results()
+                if num_results > 1:
+                    results = [await self.recv() for _ in range(num_results - 1)]
+                    results.insert(0, result[0])
+                    result = results
+                # TODO (async) maybe we should not get stuck this event loop on this ?!?
+                await cmd.set_result(result)
+        except Exception as e:
+            await self.close()
+            if cmd:
+                await cmd.set_result(e, dont_retry=True)
+            raise
 
     # Don't accept any new commands, but the read stream might still be alive
     def close_write(self):
@@ -330,6 +335,11 @@ class Connection(object):
         try:
             self.writer.close()
             await self.writer.wait_closed()
+        except Exception:
+            pass
+        try:
+            self.thread.cancel()
+            self.thread = None
         except Exception:
             pass
         try:
@@ -375,7 +385,7 @@ class Connection(object):
                     self.writer.write(x)
                     await self.writer.drain()
                 # pub/sub commands do not expect a result
-                if cmd.set_resolver(self):
+                if cmd.should_enqueue():
                     self.commands.append(cmd)
                 # TODO (async)
                 # if self.thread_event:
@@ -386,26 +396,6 @@ class Connection(object):
             await cmd.set_result(e)
         except Exception as e:
             await cmd.set_result(e)
-
-    async def resolve(self, cmd=None):
-        try:
-            async with self.read_lock:
-                # Double lock safety check
-                if cmd and cmd._got_result:
-                    return False
-                cmd = self.commands.popleft()
-                num_results = cmd.how_many_results()
-                results = [await self.recv() for _ in range(num_results)]
-            await cmd.set_result(results)
-            return True
-        except IndexError:
-            pass
-        except Exception as e:
-            await self.close()
-            # We should not retry if it/s I/O error (it might have already been executed)
-            await cmd.set_result(e, dont_retry=True)
-            # We don't raise here, because it makes no sense ?
-        return False
 
     async def recv(self, allow_empty=False):
         try:
@@ -436,7 +426,7 @@ class Connection(object):
 
 
 class Command(object):
-    __slots__ = '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue', '_server', '_asking'
+#    __slots__ = '_event', '_data', '_database', '_resolver', '_encoder', '_decoder', '_throw', '_got_result', '_result', '_retries', '_enqueue', '_server', '_asking'
 
     def __init__(self, data, database=None, encoder=None, decoder=None, throw=True, retries=3, enqueue=True, server=None):
         self._data = data
@@ -447,10 +437,10 @@ class Command(object):
         self._retries = retries
         self._enqueue = enqueue
         self._server = server
-        self._resolver = None
         self._got_result = False
         self._result = None
         self._asking = False
+        self._event = Event()
 
     def get_number(self):
         return self._database._number if self._database else None
@@ -469,9 +459,7 @@ class Command(object):
     def encode(self):
         return encode_command(self._data, self._encoder)
 
-    def set_resolver(self, connection):
-        if self._enqueue:
-            self._resolver = connection
+    def should_enqueue(self):
         return self._enqueue
 
     async def set_result(self, result, dont_retry=False):
@@ -514,29 +502,32 @@ class Command(object):
             # TODO should we call decoder on Exceptions as well ?
             self._result = result if not self._decoder else self._decoder(result)
             self._got_result = True
+            self._event.set()
             self._data = None
             self._database = None
             self._resolver = None
+            self._event = None
+        # TODO some stuff can be in finally here...
         except Exception as e:
             self._result = e
             self._got_result = True
+            self._event.set()
             self._data = None
             self._database = None
             self._resolver = None
+            self._event = None
 
+    # TODO (async) return a future instead of this...
     async def __call__(self):
-        if not self._got_result and not self._resolver:
-            raise RedisError('Command is not finalized yet')
-        # This is a loop because of multi threading.
-        while not self._got_result:
-            await self._resolver.resolve(self)
+        if not self._got_result:
+            await self._event.wait()
         if self._throw and isinstance(self._result, Exception):
             raise self._result
         return self._result
 
 
 class Multiplexer(object):
-    __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_tryindex', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots'
+#    __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_tryindex', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots'
 
     def __init__(self, configuration=None):
         self._endpoints, self._configuration = parse_uri(configuration)
@@ -753,7 +744,7 @@ class Multiplexer(object):
 
 
 class Database(object):
-    __slots__ = '_multiplexer', '_number', '_encoder', '_decoder', '_retries', '_scripts', '_scripts_sha', '_server'
+#    __slots__ = '_multiplexer', '_number', '_encoder', '_decoder', '_retries', '_scripts', '_scripts_sha', '_server'
 
     def __init__(self, multiplexer, number, encoder, decoder, retries, server):
         self._multiplexer = multiplexer
@@ -781,7 +772,7 @@ class Database(object):
 # TODO maybe split the user facing API from the internal Command one (atleast mark it as _)
 # To know the result of a multi command simply resolve any command inside
 class MultiCommand(object):
-    __slots__ = '_database', '_retries', '_server', '_cmds', '_done', '_asking'
+#    __slots__ = '_database', '_retries', '_server', '_cmds', '_done', '_asking'
 
     def __init__(self, database, retries, server):
         self._database = database
@@ -794,6 +785,7 @@ class MultiCommand(object):
     def stream(self, chunk_size):
         return chunk_encoded_commands(self._cmds, chunk_size)
 
+    # TODO (async) should_enqueue
     def set_resolver(self, connection):
         for cmd in self._cmds:
             cmd._resolver = connection
@@ -876,7 +868,7 @@ class MultiCommand(object):
 # TODO document the error model possible here and implications
 # TODO auto close by looking at the reply number of subs ? (nop)
 class PubSub(object):
-    __slots__ = '_multiplexer', '_connection', '_lock', '_msg_lock', '_msg_waiting', '_registered_instances', '_registered_channels', '_registered_patterns', '_thread'
+#    __slots__ = '_multiplexer', '_connection', '_lock', '_msg_lock', '_msg_waiting', '_registered_instances', '_registered_channels', '_registered_patterns', '_thread'
 
     def __init__(self, multiplexer):
         self._multiplexer = multiplexer
@@ -1035,7 +1027,7 @@ class PubSub(object):
 
 # Don't pass this between different invocation contexts
 class PubSubInstance(object):
-    __slots__ = '_pubsub', '_encoder', '_decoder', '_closed', '_messages'
+#    __slots__ = '_pubsub', '_encoder', '_decoder', '_closed', '_messages'
 
     def __init__(self, pubsub, encoder, decoder):
         self._pubsub = pubsub
