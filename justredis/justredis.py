@@ -1,4 +1,4 @@
-from asyncio import Lock, Event, open_connection, open_unix_connection
+from asyncio import Lock, Event, open_connection, open_unix_connection, get_running_loop
 import socket
 import sys
 from collections import deque
@@ -77,6 +77,7 @@ def bytes_as_strings(encoding='utf-8', errors='strict'):
     return bytes_as_strings_with_encoding
 
 utf8_bytes_as_strings = bytes_as_strings()
+
 
 # Redis protocol encoder / decoder
 def encode_command(data, encoder):
@@ -223,6 +224,7 @@ async def async_with_timeout(fut, timeout=None):
 
 
 class Connection(object):
+    # TODO (async) update all __slots__ in all places
     __slots__ = 'reader', 'writer', 'buffersize', 'name', 'commands', 'closed', 'read_lock', 'send_lock', 'chunk_send_size', 'buffer', 'parser', 'lastdatabase', 'select', 'thread_event', 'thread'
 
     @classmethod
@@ -250,8 +252,7 @@ class Connection(object):
                     #sock.settimeout(sockettimeout)
                     #self.socket = sock
                 elif isinstance(endpoint, tuple):
-                    connection = await async_with_timeout(open_connection(host=endpoint[0], port=endpoint[1], limit=buffersize), connecttimeout)
-                    self.reader, self.writer = connection
+                    self.reader, self.writer = await async_with_timeout(open_connection(host=endpoint[0], port=endpoint[1], limit=buffersize), connecttimeout)
                     self.buffersize = buffersize
                     # TODO (async) setup timeout
                 else:
@@ -292,6 +293,8 @@ class Connection(object):
         self.parser.send(None)
         self.lastdatabase = 0
         # TODO (async) implment
+        self.thread_event = Event()
+        self.thread = get_running_loop().call_soon(self.loop)
         #self.thread_event = None
         #if with_thread and thread:
             #self.thread_event = Event()
@@ -308,10 +311,10 @@ class Connection(object):
                 raise
 
     # This code should be exception safe
-    def loop(self):
+    async def loop(self):
         while True:
             # TODO is this meh ?
-            self.thread_event.wait()
+            await self.thread_event.wait()
             self.thread_event.clear()
             if self.closed:
                 return
