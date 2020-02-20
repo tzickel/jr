@@ -143,7 +143,7 @@ def hiredis_parser():
             res = RedisReplyError(*res.args)
         data = yield res
         if data:
-            reader.feed(*data)
+            reader.feed(data)
 
 
 # Cluster hash calculation
@@ -217,10 +217,7 @@ def parse_command(source, *args, **kwargs):
 
 
 async def async_with_timeout(fut, timeout=None):
-    if timeout is None:
-        return await fut
-    else:
-        return await asyncio.wait_for(fut, timeout=timeout)
+    return await (fut if timeout is None else asyncio.wait_for(fut, timeout=timeout))
 
 
 class Connection(object):
@@ -238,57 +235,55 @@ class Connection(object):
         connecttimeout = config.get('connecttimeout', socket.getdefaulttimeout())
         connectretry = config.get('connectretry', 0) + 1
         sockettimeout = config.get('sockettimeout', socket.getdefaulttimeout())
+        # TODO (async) 64Kb ?
         buffersize = config.get('recvbuffersize', 16384)
         tcpkeepalive = config.get('tcpkeepalive', 300)
+        # TODO (async) True ?
         tcpnodelay = config.get('tcpnodelay', False)
         while connectretry:
             try:
                 if isinstance(endpoint, str):
-                    # TODO (async) fix
-                    raise NotImplementedError()
-                    #sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    #sock.settimeout(connecttimeout)
-                    #sock.connect(endpoint)
-                    #sock.settimeout(sockettimeout)
-                    #self.socket = sock
+                    self.reader, self.writer = await async_with_timeout(open_connection(host=endpoint[0], port=endpoint[1], limit=buffersize), connecttimeout)
+                    self.buffersize = buffersize
+                    self.timeout = sockettimeout
                 elif isinstance(endpoint, tuple):
                     self.reader, self.writer = await async_with_timeout(open_connection(host=endpoint[0], port=endpoint[1], limit=buffersize), connecttimeout)
                     self.buffersize = buffersize
                     # TODO (async) setup timeout
+                    self.timeout = sockettimeout
                 else:
                     raise RedisError('Invalid endpoint')
                 break
             except connect_errors as e:
                 connectretry -= 1
                 if not connectretry:
-                    raise RedisError('Connection failed: %r' % e)
+                    # TODO is this the correct way?
+                    raise RedisError('Connection failed') from e
         # needed for cluster support
         self.name = self.writer.get_extra_info('peername')
-        #self.name = self.socket.getpeername()
-        # TODO (async) fix
-        #if self.socket.family == socket.AF_INET6:
-            #self.name = self.name[:2]
+        sock = self.writer.get_extra_info('socket')
+        if sock.family == socket.AF_INET6:
+            self.name = self.name[:2]
         # TCP connection settings
-        # TODO (async) fix settings
-        if False: #isinstance(self.socket.getsockname(), tuple):
+        if isinstance(sock.getsockname(), tuple):
             if tcpnodelay:
-                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            else:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
             if tcpkeepalive:
-                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 if platform == 'linux':
-                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, tcpkeepalive)
-                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, tcpkeepalive // 3)
-                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, tcpkeepalive)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, tcpkeepalive // 3)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
                 elif platform == 'darwin':
-                    self.socket.setsockopt(socket.IPPROTO_TCP, 0x10, tcpkeepalive // 3)
+                    sock.setsockopt(socket.IPPROTO_TCP, 0x10, tcpkeepalive // 3)
                 elif platform == 'windows':
-                    self.socket.ioctl(SIO_KEEPALIVE_VALS, (1, tcpkeepalive * 1000, tcpkeepalive // 3 * 1000))
+                    sock.ioctl(SIO_KEEPALIVE_VALS, (1, tcpkeepalive * 1000, tcpkeepalive // 3 * 1000))
         self.commands = deque()
         self.closed = False
-        self.read_lock = Lock()
         self.send_lock = Lock()
         self.chunk_send_size = 6000
-        #self.buffer = bytearray(buffersize)
         self.parser = hiredis_parser()
         self.parser.send(None)
         self.lastdatabase = 0
@@ -305,25 +300,29 @@ class Connection(object):
                 await self.close()
                 raise
 
-    # TODO (handle multicommand how_many_results....)
     async def loop(self):
         try:
             while True:
                 cmd = None
-                result = [await self.recv()]
-                # TODO on close this could abort, maybe get the recv lock ?
+                result = None
+                result = await self.recv()
+                # hmm.. maybe an I/O was sent before the command was enqueued...
                 cmd = self.commands.popleft()
                 num_results = cmd.how_many_results()
                 if num_results > 1:
                     results = [await self.recv() for _ in range(num_results - 1)]
                     results.insert(0, result[0])
                     result = results
+                    results = None
+                else:
+                    result = [result]
                 # TODO (async) maybe we should not get stuck this event loop on this ?!?
                 await cmd.set_result(result)
         except Exception as e:
             await self.close()
             if cmd:
                 await cmd.set_result(e, dont_retry=True)
+            # TODO (async) is there any point in throwing this exception here ?
             #raise
 
     # Don't accept any new commands, but the read stream might still be alive
@@ -338,92 +337,71 @@ class Connection(object):
         except Exception:
             pass
         try:
-            self.thread.cancel()
-            await self.thread
-        except Exception:
-            pass
-        try:
             self.reader.close()
             await self.reader.wait_close()
         except Exception:
             pass
-        finally:
-            self.writer = None
-            self.reader = None
-            self.thread = None
-            if self.commands:
-                # Hmmm... I think there is no threading issue here with regards to other uses of read/send locks in the code ?
-                async with self.read_lock:
-                    async with self.send_lock:
-                        for command in self.commands:
-                            # This are already sent and we don't know if they happened or not.
-                            await command.set_result(RedisError('Connection closed'), dont_retry=True)
-                        self.commands = []
-            # TODO (async)
-            #if self.thread_event:
-                #self.thread_event.set()
+        try:
+            self.thread.cancel()
+            await self.thread
+        except Exception:
+            pass
+        self.writer = None
+        self.reader = None
+        self.thread = None
+        if self.commands:
+            # Hmmm... I think there is no threading issue here with regards to other uses of read/send locks in the code ?
+            async with self.send_lock:
+                for command in self.commands:
+                    # This are already sent and we don't know if they happened or not.
+                    await command.set_result(RedisError('Connection closed'), dont_retry=True)
+                self.commands = []
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
+    # TODO (async) this is wrong, TCP NODELAY is auto set... check performance...
     async def send(self, cmd):
         try:
             async with self.send_lock:
                 db_number = cmd.get_number()
                 if db_number is not None and db_number != self.lastdatabase:
                     select_cmd = Command((b'SELECT', db_number))
+                    # We must append before writing because of the recv side loop
+                    self.commands.append(select_cmd)
                     for x in select_cmd.stream(self.chunk_send_size):
                         self.writer.write(x)
                         # TODO (async) should I drain ?
-                    self.commands.append(select_cmd)
+                    # TODO this can fail because in cluster mode, do we care ?
                     self.lastdatabase = db_number
                 if cmd._asking:
+                    # TODO must a command only be a tuple in Command ?
                     asking_cmd = Command((b'ASKING', ))
+                    self.commands.append(asking_cmd)
                     for x in asking_cmd.stream(self.chunk_send_size):
                         self.writer.write(x)
                     cmd._asking = False
-                    self.commands.append(asking_cmd)
-                # We send before we append to commands list because another thread might do resolve, and this will race
-                for x in cmd.stream(self.chunk_send_size):
-                    self.writer.write(x)
-                    await self.writer.drain()
                 # pub/sub commands do not expect a result
                 if cmd.should_enqueue():
                     self.commands.append(cmd)
-                # TODO (async)
-                # if self.thread_event:
-                    #self.thread_event.set()
-        # We should only mark the socket for closing when it's dead (and not for example in decoder exception)
-        except socket_errors as e:
+                for x in cmd.stream(self.chunk_send_size):
+                    self.writer.write(x)
+                    await self.writer.drain()
+        # TODO (async) BUG, We need better handling of closing the recv side, which might be stuck here... (from the outside)
+        except Exception as e:
             self.close_write()
             await cmd.set_result(e)
-        except Exception as e:
-            await cmd.set_result(e)
 
-    async def recv(self, allow_empty=False):
+    async def recv(self):
         try:
             res = self.parser.send(None)
             while res is False:
-                if allow_empty:
-                    return res
-                # TODO (async)
-                #length = self.socket.recv_into(self.buffer)
-                #if length == 0:
-                    #raise RedisError('Connection closed')
-                #res = self.parser.send((self.buffer, 0, length))
                 buffer = await self.reader.read(self.buffersize)
                 if not buffer:
                     raise RedisError('Connection closed')
-                res = self.parser.send((buffer, 0, len(buffer)))
+                res = self.parser.send(buffer)
             return res
         except Exception:
             await self.close()
             raise
-
-    # TODO (async) fix
-    def wait(self, timeout):
-        res = select([self.socket], [], [], timeout)
-        if not res[0]:
-            return False
-        return True
 
 
 class Command(object):
@@ -510,13 +488,15 @@ class Command(object):
             self._event = None
         # TODO some stuff can be in finally here...
         except Exception as e:
-            self._result = e
-            self._got_result = True
-            self._event.set()
-            self._data = None
-            self._database = None
-            self._resolver = None
-            self._event = None
+            # This protection is added in case we get an exception but a inner-recursion of _send_command already handled it
+            if not self._got_result:
+                self._result = e
+                self._got_result = True
+                self._event.set()
+                self._data = None
+                self._database = None
+                self._resolver = None
+                self._event = None
 
     # TODO (async) return a future instead of this...
     async def __call__(self):

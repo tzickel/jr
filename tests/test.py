@@ -8,8 +8,7 @@ from .redis_server import RedisServer, start_cluster
 def asynctest(asyncfunc):
     @functools.wraps(asyncfunc)
     def asyncwrapper(*args, **kwargs):
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(asyncfunc(*args, **kwargs))
+        return asyncio.get_event_loop().run_until_complete(asyncfunc(*args, **kwargs))
     return asyncwrapper
 
 
@@ -26,6 +25,7 @@ class TestServerWithPassword(unittest.TestCase):
         self.c0 = None
         await self.mp.close()
         self.mp = None
+        self.server.close()
         self.server = None
 
     @asynctest
@@ -36,4 +36,4 @@ class TestServerWithPassword(unittest.TestCase):
         mp = Multiplexer({'endpoints': ('localhost', self.server.port)})
         with self.assertRaises(RedisReplyError):
             await mp.database(0).commandreply(b'GET', b'a')
-        assert await self.mp.database(0).commandreply(b'GET', b'a') == None
+        self.assertEqual(await self.cr0(b'GET', b'a'), None)
