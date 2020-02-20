@@ -324,7 +324,7 @@ class Connection(object):
             await self.close()
             if cmd:
                 await cmd.set_result(e, dont_retry=True)
-            raise
+            #raise
 
     # Don't accept any new commands, but the read stream might still be alive
     def close_write(self):
@@ -339,7 +339,7 @@ class Connection(object):
             pass
         try:
             self.thread.cancel()
-            self.thread = None
+            await self.thread
         except Exception:
             pass
         try:
@@ -350,6 +350,7 @@ class Connection(object):
         finally:
             self.writer = None
             self.reader = None
+            self.thread = None
             if self.commands:
                 # Hmmm... I think there is no threading issue here with regards to other uses of read/send locks in the code ?
                 async with self.read_lock:
@@ -762,7 +763,7 @@ class Database(object):
         return cmd
 
     async def commandreply(self, *args, **kwargs):
-        return await self.command(*args, **kwargs)()
+        return await(await self.command(*args, **kwargs))()
 
     # TODO (async) implment
     def multi(self, retries=None):

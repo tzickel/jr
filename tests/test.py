@@ -32,8 +32,8 @@ class TestServerWithPassword(unittest.TestCase):
     async def test_wrongpassword(self):
         mp = Multiplexer({'endpoints': ('localhost', self.server.port), 'password': 'wrong'})
         with self.assertRaises(RedisReplyError):
-            await (await mp.database(0).command(b'GET', b'a'))()
+            await mp.database(0).commandreply(b'GET', b'a')
         mp = Multiplexer({'endpoints': ('localhost', self.server.port)})
         with self.assertRaises(RedisReplyError):
-            await (await mp.database(0).command(b'GET', b'a'))()
-        assert await (await self.mp.database(0).command(b'GET', b'a'))() == None
+            await mp.database(0).commandreply(b'GET', b'a')
+        assert await self.mp.database(0).commandreply(b'GET', b'a') == None
