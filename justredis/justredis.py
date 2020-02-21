@@ -1,4 +1,4 @@
-from asyncio import Lock, Event, open_connection, open_unix_connection, create_task
+from asyncio import Lock, Event, open_connection, open_unix_connection, create_task, ensure_future
 import socket
 import sys
 from collections import deque
@@ -449,7 +449,8 @@ class Command(object):
                 self._retries -= 1
                 # We will only retry if it's a network I/O or some redis logic
                 if isinstance(result, socket_errors):
-                    await self._database._multiplexer._send_command(self)
+                    #await self._database._multiplexer._send_command(self)
+                    ensure_future(self._database._multiplexer._send_command(self))
                     return
                 elif isinstance(result, RedisReplyError):
                     # hiredis exceptions are already encoded....
@@ -458,16 +459,19 @@ class Command(object):
                         script = self._database._scripts_sha.get(sha)
                         if script:
                             self._data = (b'EVAL', script) + self._data[2:]
-                            await self._database._multiplexer._send_command(self)
+                            ensure_future(self._database._multiplexer._send_command(self))
+                            #await self._database._multiplexer._send_command(self)
                             return
                     elif result.args[0].startswith('MOVED'):
                         _, hashslot, addr = result.args[0].split(' ')
                         hashslot = int(hashslot)
                         addr = addr.rsplit(':', 1)
                         addr = (addr[0], int(addr[1]))
+                        # TODO is there a better way then doing this like this ?
                         await self._database._multiplexer._update_slots(moved_hint=(hashslot, addr))
                         self._server = addr
-                        await self._database._multiplexer._send_command(self)
+                        #await self._database._multiplexer._send_command(self)
+                        ensure_future(self._database._multiplexer._send_command(self))
                         return
                     elif result.args[0].startswith('ASKING'):
                         _, hashslot, addr = result.args[0].split(' ')
@@ -476,7 +480,8 @@ class Command(object):
                         addr = (addr[0], int(addr[1]))
                         self._asking = True
                         self._server = addr
-                        await self._database._multiplexer._send_command(self)
+                        #await self._database._multiplexer._send_command(self)
+                        ensure_future(self._database._multiplexer._send_command(self))
                         return
             # TODO should we call decoder on Exceptions as well ?
             self._result = result if not self._decoder else self._decoder(result)
@@ -500,6 +505,7 @@ class Command(object):
 
     # TODO (async) return a future instead of this...
     async def __call__(self):
+        # TODO (async) use a future because this can cause a dead lock between if and await...
         if not self._got_result:
             await self._event.wait()
         if self._throw and isinstance(self._result, Exception):
