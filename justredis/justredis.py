@@ -573,7 +573,7 @@ class Multiplexer(object):
         if self._clustered is False:
             raise RedisError('This command only runs on cluster mode')
         res = {}
-        for endpoint in self.endpoints():
+        for endpoint in await self.endpoints():
             res[endpoint] = await self.database(server=endpoint).commandreply(*args, **kwargs)
         return res
 
