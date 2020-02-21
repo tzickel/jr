@@ -78,8 +78,63 @@ class TestServerWithPassword(unittest.TestCase):
         self.assertEqual(await self.cr0('eval', "return redis.call('get','evaltest')", 0), b'a')
         self.assertEqual(await self.cr0('eval', "return redis.call('get','evaltestno')", 0), None)
 
+    @asynctest
+    async def test_multi(self):
+        async with self.mp.database(0).multi() as m:
+            cmd1 = m.command(b'SET', b'a', b'b')
+            cmd2 = m.command(b'GET', b'a')
+        self.assertEqual(await cmd1(), b'OK')
+        self.assertEqual(await cmd2(), b'b')
 
-class TestCluster(unittest.TestCase):
+        async with self.mp.database(2).multi() as m0:
+            cmd01 = m0.command(b'SET', b'a', b'b')
+            async with self.mp.database(3).multi() as m1:
+                cmd11 = m1.command(b'SET', b'a1', b'c')
+                cmd12 = m1.command(b'GET', b'a')
+            cmd02 = m0.command(b'MGET', b'a', b'a1')
+        self.assertEqual(await cmd01(), b'OK')
+        self.assertEqual(await cmd02(), [b'b', None])
+        self.assertEqual(await cmd11(), b'OK')
+        self.assertEqual(await cmd12(), None)
+        self.assertEqual(await (await self.mp.database(2).command(b'GET', b'a'))(), b'b')
+
+    @asynctest
+    async def test_multidiscard(self):
+        async with self.mp.database(0).multi() as m:
+            cmd = m.command('nothing')
+            await m.discard()
+        with self.assertRaises(RedisError):
+            await cmd()
+"""
+        async with self.mp.database(0).multi() as m:
+            cmd = m.command('nothing')
+            with self.assertRaises(RedisError):
+                print(1)
+                await cmd()
+                print(2)
+            await m.discard()
+            print(3)
+        with self.assertRaises(RedisError):
+            await cmd()
+
+        with self.assertRaises(NameError):
+            with self.mp.database(0).multi() as m:
+                cmd = m.command('nothing')
+                asd
+                m.discard()
+        with self.assertRaises(RedisError):
+            cmd()
+
+    @asynctest
+    async def test_multierror(self):
+        with self.mp.database(0).multi() as m:
+            cmd = m.command('nosuchcommand')
+        with self.assertRaises(RedisReplyError):
+            cmd()
+"""
+
+#class TestCluster(unittest.TestCase):
+class TestCluster:
     @asynctest
     async def setUp(self):
         self.servers = start_cluster(3)

@@ -11,6 +11,7 @@ import hiredis
 
 # TODO are asyncio locks reantrent ?
 # TODO (async) make the per command event, a pool and reuse them...
+# TODO (async) implment context manager for all ?
 
 # Exceptions
 # An error response from the redis server
@@ -360,6 +361,8 @@ class Connection(object):
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
     # TODO (async) this is wrong, TCP NODELAY is auto set... check performance...
     async def send(self, cmd):
+        # maybe put the lock outside ?? else maybe a deadlock ? between here and set_result?
+        cmd.ready_to_await()
         try:
             async with self.send_lock:
                 db_number = cmd.get_number()
@@ -420,6 +423,10 @@ class Command(object):
         self._result = None
         self._asking = False
         self._event = Event()
+        self._ready_to_await = False
+
+    def ready_to_await(self):
+        self._ready_to_await = True
 
     def get_number(self):
         return self._database._number if self._database else None
@@ -505,6 +512,9 @@ class Command(object):
 
     # TODO (async) return a future instead of this...
     async def __call__(self):
+        # Can we race condition here ?
+        if not self._ready_to_await:
+            raise RedisError('Command is not finalized yet')
         # TODO (async) use a future because this can cause a dead lock between if and await...
         if not self._got_result:
             await self._event.wait()
@@ -768,26 +778,28 @@ class MultiCommand(object):
         self._cmds = []
         self._done = False
         self._asking = False
+    
+    def ready_to_await(self):
+        for cmd in self._cmds:
+            cmd.ready_to_await()
 
     def stream(self, chunk_size):
         return chunk_encoded_commands(self._cmds, chunk_size)
 
-    # TODO (async) should_enqueue
-    def set_resolver(self, connection):
-        for cmd in self._cmds:
-            cmd._resolver = connection
+    def should_enqueue(self):
         return True
 
     def get_number(self):
         return self._database._number
 
-    def set_result(self, result, dont_retry=False):
+    async def set_result(self, result, dont_retry=False):
         # TODO (question) If there is an exec error, maybe preserve the original per-cmd error as well ?
+        # TODO do like gather works...
         if isinstance(result, list):
             exec_res = result[-1]
             if isinstance(exec_res, list):
                 for cmd, res in zip(self._cmds[1:-1], exec_res):
-                    cmd.set_result([res], dont_retry=True)
+                    await cmd.set_result([res], dont_retry=True)
                 self._database = None
                 self._cmds = None
                 return
@@ -797,40 +809,40 @@ class MultiCommand(object):
         if self._database and not dont_retry and self._retries and isinstance(exec_res, Exception):
             self._retries -= 1
             if not isinstance(exec_res, RedisReplyError):
-                self._database._multiplexer._send_command(self)
+                await self._database._multiplexer._send_command(self)
                 return
 
         for cmd in self._cmds[1:-1]:
-            cmd.set_result(exec_res, dont_retry=True)
+            await cmd.set_result(exec_res, dont_retry=True)
         self._database = None
         self._cmds = None
 
     def how_many_results(self):
         return len(self._cmds)
 
-    def __enter__(self):
+    async def __aenter__(self):
         if self._done:
             raise RedisError('Multiple command already finished')
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    async def __aexit__(self, exc_type, exc_value, traceback):
         if not exc_type:
-            self.execute(True)
+            await self.execute(True)
         else:
-            self.discard(True)
+            await self.discard(True)
 
-    def discard(self, soft=False):
+    async def discard(self, soft=False):
         if self._done:
             if soft:
                 return
             raise RedisError('Multiple command already finished')
         for cmd in self._cmds:
-            cmd.set_result(RedisError('Multiple command aborted'), dont_retry=True)
+            await cmd.set_result(RedisError('Multiple command aborted'), dont_retry=True)
         self._cmds = []
         self._database = None
         self._done = True
 
-    def execute(self, soft=False):
+    async def execute(self, soft=False):
         if self._done:
             if soft:
                 return
@@ -841,8 +853,9 @@ class MultiCommand(object):
             e_cmd = Command((b'EXEC', ), self._database)
             self._cmds.insert(0, m_cmd)
             self._cmds.append(e_cmd)
-            self._database._multiplexer._send_command(self)
+            await self._database._multiplexer._send_command(self)
 
+    # TODO (async) for parity, shoudl this be await as well ?
     def command(self, *args, **kwargs):
         if self._done:
             raise RedisError('Multiple command already finished')
