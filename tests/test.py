@@ -105,7 +105,7 @@ class TestServerWithPassword(unittest.TestCase):
             await m.discard()
         with self.assertRaises(RedisError):
             await cmd()
-"""
+
         async with self.mp.database(0).multi() as m:
             cmd = m.command('nothing')
             with self.assertRaises(RedisError):
@@ -118,20 +118,20 @@ class TestServerWithPassword(unittest.TestCase):
             await cmd()
 
         with self.assertRaises(NameError):
-            with self.mp.database(0).multi() as m:
+            async with self.mp.database(0).multi() as m:
                 cmd = m.command('nothing')
                 asd
                 m.discard()
         with self.assertRaises(RedisError):
-            cmd()
+            await cmd()
 
     @asynctest
     async def test_multierror(self):
-        with self.mp.database(0).multi() as m:
+        async with self.mp.database(0).multi() as m:
             cmd = m.command('nosuchcommand')
         with self.assertRaises(RedisReplyError):
-            cmd()
-"""
+            await cmd()
+
 
 #class TestCluster(unittest.TestCase):
 class TestCluster:

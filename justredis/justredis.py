@@ -191,7 +191,7 @@ def parse_command(source, *args, **kwargs):
     cmd = args[0]
     cmd = (cmd if isinstance(cmd, bytes) else cmd.encode()).upper()
     if cmd in not_allowed_commands:
-        raise RedisError('Command is not allowed')
+        raise RedisError('Command is not allowed by this client')
     encoder = source._encoder
     decoder = source._decoder
     throw = True
@@ -289,7 +289,7 @@ class Connection(object):
         self.parser.send(None)
         self.lastdatabase = 0
         # TODO (async) use ensure_future instead ?
-        self.thread = create_task(self.loop())
+        self.thread = create_task(self._loop())
         # Password must be bytes or utf-8 encoded string
         password = config.get('password')
         if password is not None:
@@ -301,13 +301,12 @@ class Connection(object):
                 await self.close()
                 raise
 
-    async def loop(self):
+    async def _loop(self):
         try:
             while True:
                 cmd = None
-                result = None
                 result = await self.recv()
-                # hmm.. maybe an I/O was sent before the command was enqueued...
+                # TODO hmm.. maybe an I/O was sent before the command was enqueued... (pubsub for now)
                 cmd = self.commands.popleft()
                 num_results = cmd.how_many_results()
                 if num_results > 1:
@@ -317,8 +316,9 @@ class Connection(object):
                     results = None
                 else:
                     result = [result]
-                # TODO (async) maybe we should not get stuck this event loop on this ?!?
+                # Since this can block the recv loop, inside it actually calls ensure_future to not block this loop
                 await cmd.set_result(result)
+                result = None
         except Exception as e:
             await self.close()
             if cmd:
@@ -327,7 +327,13 @@ class Connection(object):
             #raise
 
     # Don't accept any new commands, but the read stream might still be alive
-    def close_write(self):
+    async def close_write(self):
+        try:
+            self.writer.write_eof()
+            # TODO (async) is there a better way to flush the buffers ?
+            await self.writer.drain()
+        except Exception:
+            pass
         self.closed = True
 
     async def close(self):
@@ -339,11 +345,13 @@ class Connection(object):
             pass
         try:
             self.reader.close()
-            await self.reader.wait_close()
+            await self.reader.wait_closed()
         except Exception:
             pass
         try:
-            self.thread.cancel()
+            # TODO (async) make sure this cancel won't cause a propegating erorr for an cmd in flight !!
+            # TODO maybe I don't need this, the closing above should throw an exception
+            #self.thread.cancel()
             await self.thread
         except Exception:
             pass
@@ -388,9 +396,8 @@ class Connection(object):
                 for x in cmd.stream(self.chunk_send_size):
                     self.writer.write(x)
                     await self.writer.drain()
-        # TODO (async) BUG, We need better handling of closing the recv side, which might be stuck here... (from the outside)
         except Exception as e:
-            self.close_write()
+            await self.close_write()
             await cmd.set_result(e)
 
     async def recv(self):
