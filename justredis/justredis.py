@@ -1,4 +1,4 @@
-from asyncio import Lock, Event, open_connection, open_unix_connection, create_task, ensure_future
+from asyncio import Lock, Event, open_connection, open_unix_connection, create_task, ensure_future, wait_for, TimeoutError as AsyncIOTimeoutError
 import socket
 import sys
 from collections import deque
@@ -13,6 +13,10 @@ import hiredis
 # TODO (async) make the per command event, a pool and reuse them...
 # TODO (async) implment context manager for all ?
 # TODO (async) think about cancelation and sheilding
+# TODO trio ? thread-safety ?
+# TODO (async) .close or .aclose?
+# TODO rego over the multiplexer code (especially for recursive locks)
+
 
 # Exceptions
 # An error response from the redis server
@@ -219,7 +223,7 @@ def parse_command(source, *args, **kwargs):
 
 
 async def async_with_timeout(fut, timeout=None):
-    return await (fut if timeout is None else asyncio.wait_for(fut, timeout))
+    return await (fut if timeout is None else wait_for(fut, timeout))
 
 
 class Connection(object):
@@ -289,6 +293,7 @@ class Connection(object):
         self.parser = hiredis_parser()
         self.parser.send(None)
         self.lastdatabase = 0
+        self._pubsub_cb = None
         # TODO (async) use ensure_future instead ?
         self.thread = create_task(self._loop())
         # Password must be bytes or utf-8 encoded string
@@ -307,7 +312,9 @@ class Connection(object):
             while True:
                 cmd = None
                 result = await self.recv()
-                # TODO hmm.. maybe an I/O was sent before the command was enqueued... (pubsub for now)
+                if self._pubsub_cb:
+                    self._pubsub_cb(result)
+                    continue
                 cmd = self.commands.popleft()
                 num_results = cmd.how_many_results()
                 if num_results > 1:
@@ -324,6 +331,8 @@ class Connection(object):
             await self.close()
             if cmd:
                 await cmd.set_result(e, dont_retry=True)
+            if self._pubsub_cb:
+                self._pubsub_cb(e)
             # TODO (async) is there any point in throwing this exception here ?
             #raise
 
@@ -411,6 +420,9 @@ class Connection(object):
         except Exception:
             await self.close()
             raise
+
+    def set_pubsub_cb(self, cb):
+        self._pubsub_cb = cb
 
 
 class Command(object):
@@ -516,7 +528,7 @@ class Command(object):
                 self._resolver = None
                 self._event = None
 
-    # TODO (async) return a future instead of this...
+    # TODO (async) return a future instead of this... (maybe not, cause of requierment to await on it)
     async def __call__(self):
         if not self._ready_to_await:
             raise RedisError('Command is not finalized yet')
@@ -567,9 +579,9 @@ class Multiplexer(object):
 
     # TODO support optional server instance for pub/sub ? (for keyspace notification at least)
     # TODO (async)
-    def pubsub(self, encoder=None, decoder=None):
+    async def pubsub(self, encoder=None, decoder=None):
         if self._pubsub is None:
-            with self._lock:
+            async with self._lock:
                 if self._pubsub is None:
                     self._pubsub = PubSub(self)
         return PubSubInstance(self._pubsub, encoder, decoder)
@@ -704,13 +716,15 @@ class Multiplexer(object):
             slots.sort(key=lambda x: x[0])
             slots = [(x[1], (x[2][0].decode(), x[2][1])) for x in slots]
             # release hosts not here from previous connections
-            remove_connections = set(self._connections) - set([x[1] for x in slots])
-            for entry in remove_connections:
-                try:
-                    connections = self._connections.pop(entry)
-                    await connections.close()
-                except Exception:
-                    pass
+            # TODO wtf, how did this work before without this if ?s
+            if self._clustered:
+                remove_connections = set(self._connections) - set([x[1] for x in slots])
+                for entry in remove_connections:
+                    try:
+                        connections = self._connections.pop(entry)
+                        await connections.close()
+                    except Exception:
+                        pass
             self._slots = slots
         finally:
             self._already_asking_for_slots = False
@@ -878,21 +892,17 @@ class PubSub(object):
     def __init__(self, multiplexer):
         self._multiplexer = multiplexer
         self._connection = None
-        self._lock = Lock()
-        self._msg_lock = Lock()
-        self._msg_waiting = Event()
         self._registered_instances = {}
         self._registered_channels = {}
         self._registered_patterns = {}
 
-    def create_connection(self):
+    async def create_connection(self):
         if self._connection is None or self._connection.closed:
-            # TODO thread safety with _get_connection from multiplexer?
-            for endpoint in self._multiplexer.endpoints():
+            # TODO thread safety with _get_connection from multiplexer? (mabe just copy here)
+            for endpoint in await self._multiplexer.endpoints():
                 try:
-                    self._connection = Connection.create(endpoint, self._multiplexer._configuration, False)
-                    if thread:
-                        self._thread = thread(self.loop)
+                    self._connection = await Connection.create(endpoint, self._multiplexer._configuration)
+                    self._connection.set_pubsub_cb(self.on_message)
                     break
                 except Exception as e:
                     exc = e
@@ -901,133 +911,106 @@ class PubSub(object):
             return True
         return False
 
-    def _command(self, cmd, *args):
-        if self.create_connection():
+    # TODO handle exception properly
+    def on_message(self, msg):
+        if isinstance(msg, Exception):
+            if not isinstance(msg, RedisReplyError):
+                self._connection.set_pubsub_cb(None)
+                self._connection = None
+            # TODO hmm... directly reconnect here ? 
+            return
+        # The reason we send subscribe messages as well, is to know when an I/O reconnection has occurred
+        if msg[0] == b'message':
+            for _instance in self._registered_channels[msg[1]]:
+                _instance._add_message(msg)
+        elif msg[0] == b'pmessage':
+            for _instance in self._registered_patterns[msg[1]]:
+                _instance._add_message(msg)
+        elif msg[0] == b'subscribe':
+            for _instance in self._registered_channels[msg[1]]:
+                _instance._add_message(msg)
+        elif msg[0] == b'psubscribe':
+            for _instance in self._registered_patterns[msg[1]]:
+                _instance._add_message(msg)
+        elif msg[0] == b'pong':
+            for _instance in self._registered_instances.keys():
+                _instance._add_message(msg)
+
+    async def _command(self, cmd, *args):
+        if await self.create_connection():
             channels = self._registered_channels.keys()
             if channels:
                 cmd = Command((b'SUBSCRIBE', ) + tuple(channels), enqueue=False, retries=0)
-                self._connection.send(cmd)
+                await self._connection.send(cmd)
             patterns = self._registered_patterns.keys()
             if patterns:
                 cmd = Command((b'PSUBSCRIBE', ) + tuple(patterns), enqueue=False, retries=0)
-                self._connection.send(cmd)
+                await self._connection.send(cmd)
             ret = True
         # If it's a new connection, it will already run the command in the given list above
         else:
             cmd = Command((cmd, ) + args, enqueue=False, retries=0)
-            self._connection.send(cmd)
+            await self._connection.send(cmd)
             ret = False
         if not self._registered_channels and not self._registered_patterns:
-            self._connection.close()
+            await self._connection.close()
         return ret
 
-    # TODO handle i/o error (reconnect / resubscribe with main lock, at start)
-    # TODO should we handle the possibility that someone called message with nothing registered ?
-    def message(self, instance, max_timeout=None):
-        try:
-            got_lock = self._msg_lock.acquire(False if instance is not None else True)
-            if not got_lock:
-                return self._msg_waiting.wait(max_timeout)
-            self._msg_waiting.clear()
-            res = self._connection.recv(allow_empty=True)
-            if res is False:
-                if self._connection.wait(max_timeout):
-                    res = self._connection.recv()
-                else:
-                    res = None
-            if res:
-                self._msg_waiting.set()
-                # The reason we send subscribe messages as well, is to know when an I/O reconnection has occurred
-                if res[0] == b'message':
-                    with self._lock:
-                        for _instance in self._registered_channels[res[1]]:
-                            _instance._add_message(res)
-                elif res[0] == b'pmessage':
-                    with self._lock:
-                        for _instance in self._registered_patterns[res[1]]:
-                            _instance._add_message(res)
-                elif res[0] == b'subscribe':
-                    with self._lock:
-                        for _instance in self._registered_channels[res[1]]:
-                            _instance._add_message(res)
-                elif res[0] == b'psubscribe':
-                    with self._lock:
-                        for _instance in self._registered_patterns[res[1]]:
-                            _instance._add_message(res)
-                elif res[0] == b'pong':
-                    with self._lock:
-                        for _instance in self._registered_instances.keys():
-                            _instance._add_message(res)
-        finally:
-            if got_lock:
-                self._msg_lock.release()
-
-    def loop(self):
-        conn = self._connection
-        while True:
-            # Drop out for a new thread if there was an I/O error
-            if self._connection != conn:
-                return
-            self.message(None)
-
     # TODO (question) should we deliver ping to everyone, or the instance who requested only ?
-    def ping(self, message=None):
-        with self._lock:
-            if message:
-                self._command(b'PING', message)
-            else:
-                self._command(b'PING')
+    async def ping(self, message=None):
+        if message:
+            await self._command(b'PING', message)
+        else:
+            await self._command(b'PING')
 
     # If in register / unregister there is an I/O at least it's bookkeeped first so later invocations will fix it
-    def register(self, instance, channels=None, patterns=None):
-        with self._lock:
-            registered = self._registered_instances.setdefault(instance, [set(), set()])
-            if channels:
-                registered[0].update(channels)
-                for channel in channels:
-                    self._registered_channels.setdefault(channel, set()).add(instance)
-            if patterns:
-                registered[1].update(patterns)
-                for pattern in patterns:
-                    self._registered_patterns.setdefault(pattern, set()).add(instance)
-            if channels:
-                # If this was a new connection, the channels were already registered
-                if self._command(b'SUBSCRIBE', *channels):
-                    return
-            if patterns:
-                self._command(b'PSUBSCRIBE', *patterns)
+    async def register(self, instance, channels=None, patterns=None):
+        registered = self._registered_instances.setdefault(instance, [set(), set()])
+        if channels:
+            registered[0].update(channels)
+            for channel in channels:
+                self._registered_channels.setdefault(channel, set()).add(instance)
+        if patterns:
+            registered[1].update(patterns)
+            for pattern in patterns:
+                self._registered_patterns.setdefault(pattern, set()).add(instance)
+        if channels:
+            # If this was a new connection, the channels were already registered
+            if await self._command(b'SUBSCRIBE', *channels):
+                return
+        if patterns:
+            await self._command(b'PSUBSCRIBE', *patterns)
 
-    def unregister(self, instance, channels=None, patterns=None):
-        with self._lock:
-            channels_to_remove = []
-            patterns_to_remove = []
-            registered_channels, registered_patterns = self._registered_instances[instance]
-            for channel in registered_channels:
-                if channels and channel not in channels:
-                    continue
-                registered_channel = self._registered_channels.get(channel)
-                if registered_channel is None:
-                    continue
-                registered_channel.discard(instance)
-                if not registered_channel:
-                    channels_to_remove.append(channel)
-            for pattern in registered_patterns:
-                if patterns and pattern not in patterns:
-                    continue
-                registered_pattern = self._registered_patterns.get(pattern)
-                if registered_pattern is None:
-                    continue
-                registered_pattern.discard(instance)
-                if not registered_pattern:
-                    patterns_to_remove.append(pattern)
-            if not registered_channels and not registered_patterns:
-                del self._registered_instances[instance]
-            if channels_to_remove:
-                # If this was a new connection, no need to unregister patterns
-                if self._command(b'UNSUBSCRIBE', *channels_to_remove):
-                    return
-            if patterns_to_remove:
-                self._command(b'PUNSUBSCRIBE', *patterns_to_remove)
+    async def unregister(self, instance, channels=None, patterns=None):
+        channels_to_remove = []
+        patterns_to_remove = []
+        registered_channels, registered_patterns = self._registered_instances[instance]
+        for channel in registered_channels:
+            if channels and channel not in channels:
+                continue
+            registered_channel = self._registered_channels.get(channel)
+            if registered_channel is None:
+                continue
+            registered_channel.discard(instance)
+            if not registered_channel:
+                channels_to_remove.append(channel)
+        for pattern in registered_patterns:
+            if patterns and pattern not in patterns:
+                continue
+            registered_pattern = self._registered_patterns.get(pattern)
+            if registered_pattern is None:
+                continue
+            registered_pattern.discard(instance)
+            if not registered_pattern:
+                patterns_to_remove.append(pattern)
+        if not registered_channels and not registered_patterns:
+            del self._registered_instances[instance]
+        if channels_to_remove:
+            # If this was a new connection, no need to unregister patterns
+            if await self._command(b'UNSUBSCRIBE', *channels_to_remove):
+                return
+        if patterns_to_remove:
+            await self._command(b'PUNSUBSCRIBE', *patterns_to_remove)
 
 
 # Don't pass this between different invocation contexts
@@ -1040,15 +1023,16 @@ class PubSubInstance(object):
         self._decoder = decoder
         self._closed = False
         self._messages = deque()
+        self._event = Event()
 
-    def __del__(self):
-        self.close()
+    #def __del__(self):
+        #self.close()
 
-    def close(self):
+    async def close(self):
         if not self._closed:
             self._closed = True
             try:
-                self._pubsub.unregister(self)
+                await self._pubsub.unregister(self)
             except Exception:
                 pass
             self._messages = None
@@ -1056,31 +1040,38 @@ class PubSubInstance(object):
             self._encoder = None
             self._pubsub = None
 
-    def add(self, channels=None, patterns=None):
-        self._cmd(self._pubsub.register, channels, patterns)
+    async def add(self, channels=None, patterns=None):
+        await self._cmd(self._pubsub.register, channels, patterns)
 
     # TODO (question) should we removed the self._messages that are related to this channels and patterns ?
-    def remove(self, channels=None, patterns=None):
-        self._cmd(self._pubsub.unregister, channels, patterns)
+    async def remove(self, channels=None, patterns=None):
+        await self._cmd(self._pubsub.unregister, channels, patterns)
 
-    def message(self, max_timeout=None):
+    async def message(self, timeout=None):
         if self._closed:
             raise RedisError('Pub/sub instance closed')
         try:
             return self._messages.popleft() if not self._decoder else self._decoder(self._messages.popleft())
         except IndexError:
-            self._pubsub.message(self, max_timeout)
+            self._event.clear()
+            if timeout is None:
+                await self._event.wait()
+            else:
+                try:
+                    await wait_for(self._event.wait(), timeout)
+                except AsyncIOTimeoutError:
+                    pass
             try:
                 return self._messages.popleft() if not self._decoder else self._decoder(self._messages.popleft())
             except IndexError:
                 return None
 
-    def ping(self, message=None):
+    async def ping(self, message=None):
         if self._closed:
             raise RedisError('Pub/sub instance closed')
-        self._pubsub.ping(message)
+        await self._pubsub.ping(message)
 
-    def _cmd(self, cmd, channels, patterns):
+    async def _cmd(self, cmd, channels, patterns):
         if self._closed:
             raise RedisError('Pub/sub instance closed')
         if channels:
@@ -1091,7 +1082,8 @@ class PubSubInstance(object):
             if isinstance(patterns, (str, bytes)):
                 patterns = [patterns]
             patterns = [self._encoder(x) for x in patterns]
-        cmd(self, channels, patterns)
+        await cmd(self, channels, patterns)
 
     def _add_message(self, msg):
         self._messages.append(msg)
+        self._event.set()

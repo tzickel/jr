@@ -109,11 +109,8 @@ class TestServerWithPassword(unittest.TestCase):
         async with self.mp.database(0).multi() as m:
             cmd = m.command('nothing')
             with self.assertRaises(RedisError):
-                print(1)
                 await cmd()
-                print(2)
             await m.discard()
-            print(3)
         with self.assertRaises(RedisError):
             await cmd()
 
@@ -133,8 +130,8 @@ class TestServerWithPassword(unittest.TestCase):
             await cmd()
 
 
-class TestCluster(unittest.TestCase):
-#class TestCluster:
+#class TestCluster(unittest.TestCase):
+class TestCluster:
     @asynctest
     async def setUp(self):
         self.servers = start_cluster(3)
@@ -215,3 +212,38 @@ class TestCluster(unittest.TestCase):
         self.assertEqual(len(result), 3)
         result = list(result.values())
         self.assertEqual(result, [b'a', b'a', b'a'])
+
+
+class TestPubSub(unittest.TestCase):
+    def setUp(self):
+        self.server = RedisServer()
+        self.mp = Multiplexer({'endpoints': ('localhost', self.server.port)})
+
+    @asynctest
+    async def tearDown(self):
+        await self.mp.close()
+        self.mp = None
+        self.server = None
+
+    @asynctest
+    async def test_basic_pubsub(self):
+        pubsub = await self.mp.pubsub()
+        cr = self.mp.database().commandreply
+        await pubsub.add('hi', 'bye')
+        self.assertEqual(await pubsub.message(), [b'subscribe', b'hi', 1])
+        self.assertEqual(await pubsub.message(), [b'psubscribe', b'bye', 2])
+        self.assertEqual(await pubsub.message(0.1), None)
+        await cr(b'PUBLISH', 'hi', 'there')
+        self.assertEqual(await pubsub.message(0.1), [b'message', b'hi', b'there'])
+        await cr(b'PUBLISH', 'bye', 'there')
+        self.assertEqual(await pubsub.message(0.1), [b'pmessage', b'bye', b'bye', b'there'])
+        await pubsub.ping()
+        self.assertEqual(await pubsub.message(), [b'pong', b''])
+        await pubsub.ping('hi')
+        self.assertEqual(await pubsub.message(0.1), [b'pong', b'hi'])
+        await pubsub.remove('hi')
+        await pubsub.close()
+
+
+if __name__ == '__main__':
+    unittest.main()
