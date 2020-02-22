@@ -518,10 +518,8 @@ class Command(object):
 
     # TODO (async) return a future instead of this...
     async def __call__(self):
-        # Can we race condition here ?
         if not self._ready_to_await:
             raise RedisError('Command is not finalized yet')
-        # TODO (async) use a future because this can cause a dead lock between if and await...
         if not self._got_result:
             await self._event.wait()
         if self._throw and isinstance(self._result, Exception):
@@ -765,9 +763,8 @@ class Database(object):
         return cmd
 
     async def commandreply(self, *args, **kwargs):
-        return await(await self.command(*args, **kwargs))()
+        return await (await self.command(*args, **kwargs))()
 
-    # TODO (async) implment
     def multi(self, retries=None):
         return MultiCommand(self, retries if retries is not None else self._retries, server=self._server)
 
@@ -800,7 +797,7 @@ class MultiCommand(object):
 
     async def set_result(self, result, dont_retry=False):
         # TODO (question) If there is an exec error, maybe preserve the original per-cmd error as well ?
-        # TODO do like gather works...
+        # TODO (async) do like gather works...
         if isinstance(result, list):
             exec_res = result[-1]
             if isinstance(exec_res, list):
@@ -815,7 +812,9 @@ class MultiCommand(object):
         if self._database and not dont_retry and self._retries and isinstance(exec_res, Exception):
             self._retries -= 1
             if not isinstance(exec_res, RedisReplyError):
-                await self._database._multiplexer._send_command(self)
+                # TODO (async) should I be catching the exception here like in Command set_result ?
+                #await self._database._multiplexer._send_command(self)
+                ensure_future(self._database._multiplexer._send_command(self))
                 return
 
         for cmd in self._cmds[1:-1]:
@@ -861,7 +860,7 @@ class MultiCommand(object):
             self._cmds.append(e_cmd)
             await self._database._multiplexer._send_command(self)
 
-    # TODO (async) for parity, shoudl this be await as well ?
+    # TODO (async) for parity, should this be await as well ?
     def command(self, *args, **kwargs):
         if self._done:
             raise RedisError('Multiple command already finished')
