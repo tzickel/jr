@@ -133,8 +133,8 @@ class TestServerWithPassword(unittest.TestCase):
             await cmd()
 
 
-#class TestCluster(unittest.TestCase):
-class TestCluster:
+class TestCluster(unittest.TestCase):
+#class TestCluster:
     @asynctest
     async def setUp(self):
         self.servers = start_cluster(3)

@@ -12,6 +12,7 @@ import hiredis
 # TODO are asyncio locks reantrent ?
 # TODO (async) make the per command event, a pool and reuse them...
 # TODO (async) implment context manager for all ?
+# TODO (async) think about cancelation and sheilding
 
 # Exceptions
 # An error response from the redis server
@@ -218,7 +219,7 @@ def parse_command(source, *args, **kwargs):
 
 
 async def async_with_timeout(fut, timeout=None):
-    return await (fut if timeout is None else asyncio.wait_for(fut, timeout=timeout))
+    return await (fut if timeout is None else asyncio.wait_for(fut, timeout))
 
 
 class Connection(object):
@@ -359,7 +360,6 @@ class Connection(object):
         self.reader = None
         self.thread = None
         if self.commands:
-            # Hmmm... I think there is no threading issue here with regards to other uses of read/send locks in the code ?
             async with self.send_lock:
                 for command in self.commands:
                     # This are already sent and we don't know if they happened or not.
@@ -369,7 +369,6 @@ class Connection(object):
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
     # TODO (async) this is wrong, TCP NODELAY is auto set... check performance...
     async def send(self, cmd):
-        # maybe put the lock outside ?? else maybe a deadlock ? between here and set_result?
         cmd.ready_to_await()
         try:
             async with self.send_lock:
