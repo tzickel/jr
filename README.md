@@ -42,20 +42,23 @@ import asyncio
 async def main():
     # Connect to the default redis port on localhost
     redis = Multiplexer()
-    # Send commands to database #0 (and use by default bytes as utf8 strings decoder)
-    db = redis.database(decoder=utf8_bytes_as_strings)
-    # Shortcut so you don't have to type long words each time
-    c = db.command
-    cr = db.commandreply
-    # Send an pipelined SET request where you don't care about the result (You don't have to use bytes notation or caps)
-    await c(b'SET', 'Hello', 'World!')
-    # Send a pipelined GET request and resolve it immediately
-    print('Hello, %s' % await cr(b'GET', 'Hello'))
-    # You can even send both commands together atomically (so if the first fails the second won't run)
-    async with db.multi() as m:
-        m.command(b'SET', 'Hello', 'World!')
-        hello = m.command(b'GET', 'Hello')
-    print('Atomic Hello, %s' % await hello())
+    try:
+        # Send commands to database #0 (and use by default bytes as utf8 strings decoder)
+        db = redis.database(decoder=utf8_bytes_as_strings)
+        # Shortcut so you don't have to type long words each time
+        c = db.command
+        cr = db.commandreply
+        # Send an pipelined SET request where you don't care about the result (You don't have to use bytes notation or caps)
+        await c(b'SET', 'Hello', 'World!')
+        # Send a pipelined GET request and resolve it immediately
+        print('Hello, %s' % await cr(b'GET', 'Hello'))
+        # You can even send both commands together atomically (so if the first fails the second won't run)
+        async with db.multi() as m:
+            m.command(b'SET', 'Hello', 'World!')
+            hello = m.command(b'GET', 'Hello')
+        print('Atomic Hello, %s' % await hello())
+    finally:
+        await redis.aclose()
 
 
 if __name__ == '__main__':

@@ -23,7 +23,7 @@ class TestServerWithPassword(unittest.TestCase):
     async def tearDown(self):
         self.cr0 = None
         self.c0 = None
-        await self.mp.close()
+        await self.mp.aclose()
         self.mp = None
         self.server.close()
         self.server = None
@@ -157,7 +157,7 @@ class TestCluster(unittest.TestCase):
     async def tearDown(self):
         self.cr0 = None
         self.c0 = None
-        await self.mp.close()
+        await self.mp.aclose()
         self.mp = None
         # TODO close as well?
         self.servers = None
@@ -220,7 +220,7 @@ class TestPubSub(unittest.TestCase):
 
     @asynctest
     async def tearDown(self):
-        await self.mp.close()
+        await self.mp.aclose()
         self.mp = None
         self.server = None
 

@@ -13,7 +13,6 @@ import hiredis
 # TODO (async) implment context manager for all ?
 # TODO (async) think about cancelation and sheilding
 # TODO trio ? thread-safety ?
-# TODO (async) .close or .aclose?
 # TODO rego over the multiplexer code (especially for recursive locks)
 
 
@@ -297,7 +296,7 @@ class Connection:
                 await self.send(cmd)
                 await cmd()
             except Exception:
-                await self.close()
+                await self.aclose()
                 raise
 
     async def _loop(self):
@@ -327,14 +326,14 @@ class Connection:
                 except Exception:
                     pass
                 self._pubsub_cb = None
-            await self.close()
+            await self.aclose()
             if cmd:
                 await cmd.set_result(e, dont_retry=True)
             # TODO (async) is there any point in throwing this exception here ?
             #raise
 
     # Don't accept any new commands, but the read stream might still be alive
-    async def close_write(self):
+    async def aclose_write(self):
         try:
             self.writer.write_eof()
             # TODO (async) is there a better way to flush the buffers ?
@@ -343,7 +342,7 @@ class Connection:
             pass
         self.closed = True
 
-    async def close(self):
+    async def aclose(self):
         self.closed = True
         try:
             self.writer.close()
@@ -410,7 +409,7 @@ class Connection:
             # TODO should we call drain here ?
             #await self.writer.drain()
         except Exception as e:
-            await self.close_write()
+            await self.aclose_write()
             await cmd.set_result(e)
 
     async def recv(self):
@@ -423,7 +422,7 @@ class Connection:
                 res = self.parser.send(buffer)
             return res
         except Exception:
-            await self.close()
+            await self.aclose()
             raise
 
     def set_pubsub_cb(self, cb):
@@ -561,19 +560,15 @@ class Multiplexer:
         self._slots = []
 
     # TODO have a closed flag, and stop requesting new connections?
-    async def close(self):
+    async def aclose(self):
         async with self._lock:
             try:
                 for connection in self._connections.values():
-                    await connection.close()
+                    await connection.aclose()
             except Exception:
                 pass
             self._connections = {}
             self._last_connection = None
-
-    # TODO (question) is this sane or we should not support this (explicitly call close?)
-    #async def __del__(self):
-        #await self.close()
 
     def database(self, number=0, encoder=None, decoder=None, retries=3, server=None):
         if number != 0 and self._clustered and server is None:
@@ -628,7 +623,7 @@ class Multiplexer:
                             except Exception as e:
                                 exp = e
                                 try:
-                                    await conn.close()
+                                    await conn.aclose()
                                 except:
                                     pass
                                 self._connections.pop(addr, None)
@@ -725,7 +720,7 @@ class Multiplexer:
                 for entry in remove_connections:
                     try:
                         connections = self._connections.pop(entry)
-                        await connections.close()
+                        await connections.aclose()
                     except Exception:
                         pass
             self._slots = slots
@@ -902,7 +897,7 @@ class PubSub:
     # This can only be called by the multiplexer, afterwards we shouldn't be able to re-use it
     async def aclose(self):
         self._multiplexer = None
-        await self._connection.close()
+        await self._connection.aclose()
 
     async def create_connection(self):
         if self._connection is None or self._connection.closed:
@@ -958,7 +953,7 @@ class PubSub:
 
     async def _command(self, cmd, *args):
         if not self._registered_channels and not self._registered_patterns:
-            await self._connection.close()
+            await self._connection.aclose()
             return True
         else:
             # TODO (question) maybe we should soft fail here on I/O error, so that only async message() will be the error point
