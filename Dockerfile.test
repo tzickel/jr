@@ -1,0 +1,17 @@
+FROM quay.io/pypa/manylinux2014_x86_64
+
+RUN cd /tmp && curl -s http://download.redis.io/releases/redis-5.0.7.tar.gz -O && tar -xvzof redis-5.0.7.tar.gz && cd redis-5.0.7 && make install
+
+WORKDIR /opt
+
+#ADD https://api.github.com/repos/tzickel/jr/git/refs/heads/master version.json
+
+#RUN git clone https://github.com/tzickel/jr
+
+WORKDIR /opt/jr
+
+ADD . .
+
+RUN /opt/python/cp38-cp38/bin/python setup.py test
+RUN /opt/python/cp37-cp37m/bin/python setup.py test
+RUN /opt/python/cp36-cp36m/bin/python setup.py test
