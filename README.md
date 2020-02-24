@@ -11,7 +11,7 @@ An asynchronous redis client library for Python 3.7+
 * Pub/Sub
 * Transparent script caching
 * Retry support only when it's safe
-* Hiredis parser
+* Hiredis parser (required)
 * Testing with private redis server and cluster
 
 # Inherit limitations
@@ -29,20 +29,20 @@ An asynchronous redis client library for Python 3.7+
 For now you can install this via this github repository by pip installing or adding to your requirements.txt file:
 
 ```
-https://github.com/tzickel/justredis/archive/master.zip
+git+git://github.com/tzickel/jr@master#egg=justredis
 ```
 
 Replace master with the specific branch or version tag you want.
 
 # Examples
 ```python
-from justredis import MultiplexerAsync, utf8_bytes_as_strings
+from justredis import Multiplexer, utf8_bytes_as_strings
 import asyncio
 
 
 async def main():
     # Connect to the default redis port on localhost
-    redis = MultiplexerAsync()
+    redis = Multiplexer()
     # Send commands to database #0 (and use by default bytes as utf8 strings decoder)
     db = redis.database(decoder=utf8_bytes_as_strings)
     # Shortcut so you don't have to type long words each time
@@ -51,11 +51,11 @@ async def main():
     # Send an pipelined SET request where you don't care about the result (You don't have to use bytes notation or caps)
     await c(b'SET', 'Hello', 'World!')
     # Send a pipelined GET request and resolve it immediately
-    print('Hello, %s' % await cr('get', 'Hello'))
+    print('Hello, %s' % await cr(b'GET', 'Hello'))
     # You can even send both commands together atomically (so if the first fails the second won't run)
     async with db.multi() as m:
         m.command(b'SET', 'Hello', 'World!')
-        hello = m.command('get', 'Hello')
+        hello = m.command(b'GET', 'Hello')
     print('Atomic Hello, %s' % await hello())
 
 
