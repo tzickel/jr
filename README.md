@@ -2,15 +2,14 @@
 An asynchronous redis client library for Python 3.7+
 
 # Why?
-* All commands are pipelined (asynchronous)
+* All commands are pipelined by default
 * No connection pool, a single connection per redis server even between different execution contexts (extra one if using pub/sub)
-* Optional per command encoding / decoding / retries
+* Optional per connection or per command encoding / decoding / pipelining
 
 # Also supports
 * Redis Cluster
 * Pub/Sub
 * Transparent script caching
-* Retry support only when it's safe
 * Hiredis parser (required)
 * Testing with private redis server and cluster
 

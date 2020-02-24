@@ -1,4 +1,4 @@
-from asyncio import Lock, Event, open_connection, open_unix_connection, create_task, ensure_future, wait_for, TimeoutError as AsyncIOTimeoutError
+from asyncio import Lock, Event, open_connection, open_unix_connection, ensure_future, wait_for, TimeoutError as AsyncIOTimeoutError
 import socket
 import sys
 from collections import deque
@@ -28,10 +28,6 @@ class RedisError(Exception):
     pass
 
 
-def encode_number(number):
-    return str(number).encode()
-
-
 connect_errors = (ConnectionError, socket.error, socket.timeout)
 
 
@@ -48,23 +44,23 @@ elif sys.platform.startswith('win'):
     platform = 'windows'
 
 
-# TODO change to set
-not_allowed_commands = (b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE')
+# TODO populate this list dynamically from command info ?
+not_allowed_commands = set((b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
 
 
 # Basic encoder
 def encode(encoding='utf-8', errors='strict'):
     def encode_with_encoding(inp, encoding=encoding, errors=errors):
-        if isinstance(inp, bytes):
+        if isinstance(inp, (bytes, bytearray)):
             return inp
         elif isinstance(inp, str):
             return inp.encode(encoding, errors)
         elif isinstance(inp, bool):
             raise ValueError('Invalid input for encoding')
         elif isinstance(inp, int):
-            return str(inp).encode()
+            return b'%d' % inp
         elif isinstance(inp, float):
-            return repr(inp).encode()
+            return b'%r' % inp
         raise ValueError('Invalid input for encoding')
     return encode_with_encoding
 
@@ -86,10 +82,10 @@ utf8_bytes_as_strings = bytes_as_strings()
 
 # Redis protocol encoder / decoder
 def encode_command(data, encoder):
-    output = [b'*', encode_number(len(data)), b'\r\n']
+    output = [b'*%d\r\n' % len(data)]
     for arg in data:
         arg = encoder(arg)
-        output.extend([b'$', encode_number(len(arg)), b'\r\n', arg, b'\r\n'])
+        output.extend((b'$%d\r\n' % len(arg), arg, b'\r\n'))
     return output
 
 
@@ -204,7 +200,7 @@ def parse_command(source, *args, **kwargs):
         encoder = kwargs.get('encoder', encoder)
         decoder = kwargs.get('decoder', decoder)
         throw = kwargs.get('throw', throw)
-        retries = kwargs.get('retries', retries)
+        #retries = kwargs.get('retries', retries)
     # Handle script caching
     if cmd == b'EVAL':
         script = args[1]
@@ -246,7 +242,7 @@ class Connection:
         while connectretry:
             try:
                 if isinstance(endpoint, str):
-                    self.reader, self.writer = await async_with_timeout(open_connection(host=endpoint[0], port=endpoint[1], limit=buffersize), connecttimeout)
+                    self.reader, self.writer = await async_with_timeout(open_unix_connection(path=endpoint, limit=buffersize), connecttimeout)
                     self.buffersize = buffersize
                     self.timeout = sockettimeout
                 elif isinstance(endpoint, tuple):
@@ -291,8 +287,8 @@ class Connection:
         self.parser.send(None)
         self.lastdatabase = 0
         self._pubsub_cb = None
-        # TODO (async) use ensure_future instead ?
-        self.thread = create_task(self._loop())
+        # Using ensure_future and not create_task for Python 3.6 compatability
+        self.thread = ensure_future(self._loop())
         # Password must be bytes or utf-8 encoded string
         password = config.get('password')
         if password is not None:
@@ -325,11 +321,15 @@ class Connection:
                 await cmd.set_result(result)
                 result = None
         except Exception as e:
+            if self._pubsub_cb:
+                try:
+                    self._pubsub_cb(e)
+                except Exception:
+                    pass
+                self._pubsub_cb = None
             await self.close()
             if cmd:
                 await cmd.set_result(e, dont_retry=True)
-            if self._pubsub_cb:
-                self._pubsub_cb(e)
             # TODO (async) is there any point in throwing this exception here ?
             #raise
 
@@ -371,8 +371,11 @@ class Connection:
                 await command.set_result(RedisError('Connection closed'), dont_retry=True)
             self.commands = []
         if self._pubsub_cb:
-            # TODO something better?
-            self._pubsub_cb(None)
+            try:
+                # In case someone closed this connection not from an I/O error
+                self._pubsub_cb(RedisError('Connection closed'))
+            except Exception:
+                pass
         self._pubsub_cb = None
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
@@ -886,7 +889,6 @@ class MultiCommand:
 # TODO the multiplexer .close should close this as well ?
 # TODO document the error model possible here and implications
 # TODO auto close by looking at the reply number of subs ? (nop)
-# TODO implment close...
 class PubSub:
     __slots__ = '_multiplexer', '_connection', '_registered_instances', '_registered_channels', '_registered_patterns'
 
@@ -897,12 +899,20 @@ class PubSub:
         self._registered_channels = {}
         self._registered_patterns = {}
 
+    # This can only be called by the multiplexer, afterwards we shouldn't be able to re-use it
+    async def aclose(self):
+        self._multiplexer = None
+        await self._connection.close()
+
     async def create_connection(self):
         if self._connection is None or self._connection.closed:
+            if not self._multiplexer:
+                raise RedisError('Pub/sub instance closed')
             # TODO thread safety with _get_connection from multiplexer? (mabe just copy here)
             for endpoint in await self._multiplexer.endpoints():
                 try:
                     self._connection = await Connection.create(endpoint, self._multiplexer._configuration)
+                    # TODO move this to the constructor ?
                     self._connection.set_pubsub_cb(self.on_message)
                     break
                 except Exception as e:
@@ -912,13 +922,14 @@ class PubSub:
             return True
         return False
 
-    # TODO handle exception properly
     def on_message(self, msg):
         if isinstance(msg, Exception):
-            if not isinstance(msg, RedisReplyError):
-                self._connection.set_pubsub_cb(None)
-                self._connection = None
-            # TODO hmm... directly reconnect here ? 
+            # TODO can we get here RedisReplyError ? if so, how should we handle it (to whom to forward it ?)
+            # Don't set to None, lots of usage of it here.
+            #self._connection = None
+            # We don't reconnect here, because we want the user to do it on calls to .message again (which can fail again)
+            for _instance in self._registered_instances.keys():
+                _instance._add_message(msg)
             return
         # The reason we send subscribe messages as well, is to know when an I/O reconnection has occurred
         if msg[0] == b'message':
@@ -937,11 +948,20 @@ class PubSub:
             for _instance in self._registered_instances.keys():
                 _instance._add_message(msg)
 
+    async def check_connection(self, instance):
+        if not self._multiplexer:
+            raise RedisError('Pub/sub instance closed')
+        if not self._registered_instances.get(instance):
+            raise RedisError('Not registered on any topic, not allowing to listen to messages')
+        # TODO (async) we need to lock this, so 2 context can't recreate 2 connections
+        await self.create_connection()
+
     async def _command(self, cmd, *args):
         if not self._registered_channels and not self._registered_patterns:
             await self._connection.close()
             return True
         else:
+            # TODO (question) maybe we should soft fail here on I/O error, so that only async message() will be the error point
             if await self.create_connection():
                 channels = self._registered_channels.keys()
                 if channels:
@@ -1028,6 +1048,14 @@ class PubSubInstance:
         self._messages = deque()
         self._event = Event()
 
+    async def __aenter__(self):
+        if self._closed:
+            raise RedisError('Pub/sub instance closed')
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self.aclose()
+
     async def aclose(self):
         if not self._closed:
             self._closed = True
@@ -1044,29 +1072,27 @@ class PubSubInstance:
     async def add(self, channels=None, patterns=None):
         await self._cmd(self._pubsub.register, channels, patterns)
 
-    # TODO (question) should we removed the self._messages that are related to this channels and patterns ?
+    # TODO (question) should we removed the self._messages that are not related to this channels and patterns (left overs)?
     async def remove(self, channels=None, patterns=None):
         await self._cmd(self._pubsub.unregister, channels, patterns)
 
     async def message(self, timeout=None):
         if self._closed:
             raise RedisError('Pub/sub instance closed')
-        try:
-            return self._messages.popleft() if not self._decoder else self._decoder(self._messages.popleft())
-        except IndexError:
-            self._event.clear()
-            if timeout is None:
-                await self._event.wait()
-            else:
-                try:
-                    await wait_for(self._event.wait(), timeout)
-                except AsyncIOTimeoutError:
-                    pass
-            # TODO skip this part ?
+        msg = self._get_message()
+        if msg is not None:
+            return msg
+        self._event.clear()
+        # We check connection here to notify the end user if there is an connection error...
+        await self._pubsub.check_connection(self)
+        if timeout is None:
+            await self._event.wait()
+        else:
             try:
-                return self._messages.popleft() if not self._decoder else self._decoder(self._messages.popleft())
-            except IndexError:
-                return None
+                await wait_for(self._event.wait(), timeout)
+            except AsyncIOTimeoutError:
+                pass
+        return self._get_message()
 
     async def ping(self, message=None):
         if self._closed:
@@ -1090,10 +1116,13 @@ class PubSubInstance:
         self._messages.append(msg)
         self._event.set()
 
-    async def __aenter__(self):
-        if self._closed:
-            raise RedisError('Pub/sub instance closed')
-        return self
-
-    async def __aexit__(self, exc_type, exc_value, traceback):
-        await self.aclose()
+    def _get_message(self):
+        try:
+            msg = self._messages.popleft()
+        except IndexError:
+            return None
+        if self._decoder:
+            msg = self._decoder(msg)
+        if isinstance(msg, Exception):
+            raise msg
+        return msg

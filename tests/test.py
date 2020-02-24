@@ -228,6 +228,8 @@ class TestPubSub(unittest.TestCase):
     async def test_basic_pubsub(self):
         pubsub = await self.mp.pubsub()
         cr = self.mp.database().commandreply
+        with self.assertRaises(RedisError):
+            self.assertEqual(await pubsub.message(), [b'subscribe', b'hi', 1])
         await pubsub.add('hi', 'bye')
         self.assertEqual(await pubsub.message(), [b'subscribe', b'hi', 1])
         self.assertEqual(await pubsub.message(), [b'psubscribe', b'bye', 2])
