@@ -910,6 +910,9 @@ class PubSub:
             # TODO thread safety with _get_connection from multiplexer? (mabe just copy here)
             for endpoint in await self._multiplexer.endpoints():
                 try:
+                    # This is done in the loop in case another PubSubInstance is trying to access this codepath as well, so we don't create 2 connections.
+                    if self._connection is not None and not self._connection.closed:
+                        return False
                     self._connection = await Connection.create(endpoint, self._multiplexer._configuration)
                     # TODO move this to the constructor ?
                     self._connection.set_pubsub_cb(self.on_message)
@@ -952,7 +955,6 @@ class PubSub:
             raise RedisError('Pub/sub instance closed')
         if not self._registered_instances.get(instance):
             raise RedisError('Not registered on any topic, not allowing to listen to messages')
-        # TODO (async) we need to lock this, so 2 context can't recreate 2 connections
         await self.create_connection()
 
     async def _command(self, cmd, *args):
