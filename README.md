@@ -13,7 +13,7 @@ An asynchronous redis client library for Python 3.6+
 * Hiredis parser (required)
 * Testing with private redis server and cluster
 
-# Inherit limitations
+# Inherit limitations (can be solved with a connection pool on top of current code)
 * Cannot issue blocking commands (such as BLPOP)
 * Cannot issue transaction commands with WATCH (but MULTI and EXEC can be used)
 
@@ -69,26 +69,30 @@ This is all the API in a nutshell:
 
 ```python
 Multiplexer(configuration=None)
-  database(number=0, encoder=utf8_encode, decoder=None, retries=3, server=None)
-    command(*args, encoder=utf8_encode, decoder=None, retries=3, throw=True)
-      __call__()
-    commandreply(*args, encoder=utf8_encode, decoder=None, retries=3, throw=True)
+  async __aenter__()
+  async __aexit__()
+  async aclose()
+  database(number=0, encoder=utf8_encode, decoder=None)
+    async command(*args, encoder=utf8_encode, decoder=None, throw=True)
+      async __call__()
+    async commandreply(*args, encoder=utf8_encode, decoder=None, throw=True)
     multi(retries=None)
-      command(*args, encoder=utf8_encode, decoder=None, retries=3, throw=True)
-        __call__()
-      execute()
-      discard()
-      __enter__()
-      __exit__()
+      command(*args, encoder=utf8_encode, decoder=None, throw=True)
+        async __call__()
+      async execute()
+      async discard()
+      async __aenter__()
+      async __aexit__()
   pubsub(encoder=utf8_encode, decoder=None)
-    add(channels=None, patterns=None)
-    remove(channels=None, patterns=None)
-    message(max_timeout=None)
-    ping(message=None)
-  endpoints()
-  run_commandreply_on_all_masters(*args, encoder=utf8_encode, decoder=None, retries=3)
-  close()
+    async add(channels=None, patterns=None)
+    async remove(channels=None, patterns=None)
+    async message(timeout=None)
+    async ping(message=None)
+  async endpoints()
+  async run_commandreply_on_all_masters(*args, encoder=utf8_encode, decoder=None)
 ```
+
+Notice that .command in multi is not awaitable
 
 Where configuration is a list of endpoints or a dictionary that can contain the following keys:
 
@@ -97,9 +101,9 @@ Where configuration is a list of endpoints or a dictionary that can contain the 
 * connecttimeout - Set connect timeout in seconds
 * connectretry - Number of connection attempts before giving up
 * sockettimeout - Set socket timeout in seconds
-* recvbuffersize - Socket receive buffer size in bytes (Default 16K)
-* tcpkeepalive - Enable (Default 300 seconds) / Disable TCP Keep alive in seconds
-* tcpnodelay - Enable / Disable (Default) TCP no delay
+* recvbuffersize - Socket receive buffer size in bytes (Default 64K)
+* tcpkeepalive - Enable / Disable (Default) TCP Keep alive in seconds
+* tcpnodelay - Enable (Default) / Disable TCP no delay
 * connectionhandler - Use a custom Connection class handler
 
 # Partially inspired by
