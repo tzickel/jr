@@ -18,7 +18,7 @@ class TestServerWithPassword(unittest.TestCase):
         self.mp = Multiplexer({'endpoints': ('localhost', self.server.port), 'password': 'blah'})
         self.c0 = self.mp.database(0).command
         self.cr0 = self.mp.database(0).commandreply
-    
+
     @asynctest
     async def tearDown(self):
         self.cr0 = None

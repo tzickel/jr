@@ -15,8 +15,7 @@ setup(
     name='justredis',
     version=version,
     packages=['justredis'],
-    # TODO which python version ?
-    python_requires=">=3.7",
+    python_requires=">=3.6",
     install_requires=['hiredis>=0.1.3'],
     test_suite="tests"
 )

@@ -21,7 +21,6 @@ import hiredis
 class RedisReplyError(Exception):
     pass
 
-
 # An error from this library
 class RedisError(Exception):
     pass
@@ -147,13 +146,11 @@ def hiredis_parser():
 
 # Cluster hash calculation
 def calc_hash(key):
-    try:
-        s = key.index(b'{')
-        e = key.index(b'}')
+    s = key.find(b'{')
+    if s != -1:
+        e = key.find(b'}')
         if e > s + 1:
             key = key[s + 1:e]
-    except ValueError:
-        pass
     return crc_hqx(key, 0) % 16384
 
 
@@ -220,10 +217,10 @@ async def async_with_timeout(fut, timeout=None):
 
 
 class Connection:
-    __slots__ = 'reader', 'writer', 'buffersize', 'timeout', 'name', 'commands', 'closed', 'chunk_send_size', 'parser', 'lastdatabase', '_pubsub_cb', 'thread'
+    __slots__ = 'reader', 'writer', 'buffersize', 'timeout', 'name', 'commands', 'closed', 'chunk_send_size', 'parser', 'lastdatabase', '_pubsub_cb', 'thread', 'cleanedup'
 
     @classmethod
-    async def create(cls, endpoint, config):
+    async def create(cls, endpoint, config={}):
         connectionhandler = config.get('connectionhandler', cls)
         connection = connectionhandler()
         await connection._init(endpoint, config)
@@ -288,6 +285,7 @@ class Connection:
         self._pubsub_cb = None
         # Using ensure_future and not create_task for Python 3.6 compatability
         self.thread = ensure_future(self._loop())
+        self.cleanedup = False
         # Password must be bytes or utf-8 encoded string
         password = config.get('password')
         if password is not None:
@@ -305,6 +303,7 @@ class Connection:
                 cmd = None
                 result = await self.recv()
                 if self._pubsub_cb:
+                    # TODO can this fail, should we catch exceptions and ignore here ?
                     self._pubsub_cb(result)
                     continue
                 cmd = self.commands.popleft()
@@ -344,38 +343,36 @@ class Connection:
 
     async def aclose(self):
         self.closed = True
-        try:
-            self.writer.close()
-            await self.writer.wait_closed()
-        except Exception:
-            pass
-        try:
-            self.reader.close()
-            await self.reader.wait_closed()
-        except Exception:
-            pass
-        try:
-            # TODO (async) make sure this cancel won't cause a propegating erorr for an cmd in flight !!
-            # TODO maybe I don't need this, the closing above should throw an exception
-            #self.thread.cancel()
-            await self.thread
-        except Exception:
-            pass
-        self.writer = None
-        self.reader = None
-        self.thread = None
-        if self.commands:
-            for command in self.commands:
-                # This are already sent and we don't know if they happened or not.
-                await command.set_result(RedisError('Connection closed'), dont_retry=True)
-            self.commands = []
-        if self._pubsub_cb:
+        if not self.cleanedup:
+            self.cleanedup = True
             try:
-                # In case someone closed this connection not from an I/O error
-                self._pubsub_cb(RedisError('Connection closed'))
+                self.writer.close()
+                await self.writer.wait_closed()
             except Exception:
                 pass
-        self._pubsub_cb = None
+            #try:
+                # TODO figure out if we really need to await here, and it's implications
+                # TODO (async) make sure this cancel won't cause a propegating erorr for an cmd in flight !!
+                # TODO maybe I don't need this, the closing above should throw an exception
+                #self.thread.cancel()
+                #await self.thread
+            #except Exception:
+                #raise
+            self.writer = None
+            self.reader = None
+            self.thread = None
+            if self.commands:
+                for command in self.commands:
+                    # This are already sent and we don't know if they happened or not.
+                    await command.set_result(RedisError('Connection closed'), dont_retry=True)
+                self.commands = []
+            if self._pubsub_cb:
+                try:
+                    # In case someone closed this connection not from an I/O error
+                    self._pubsub_cb(RedisError('Connection closed'))
+                except Exception:
+                    pass
+            self._pubsub_cb = None
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
     # TODO (async) this is wrong, TCP NODELAY is auto set... check performance...
@@ -559,6 +556,12 @@ class Multiplexer:
         self._already_asking_for_slots = False
         self._slots = []
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self.aclose()
+
     # TODO have a closed flag, and stop requesting new connections?
     async def aclose(self):
         async with self._lock:
@@ -623,7 +626,8 @@ class Multiplexer:
                             except Exception as e:
                                 exp = e
                                 try:
-                                    await conn.aclose()
+                                    if conn:
+                                        await conn.aclose()
                                 except:
                                     pass
                                 self._connections.pop(addr, None)
@@ -1108,8 +1112,9 @@ class PubSubInstance:
         await cmd(self, channels, patterns)
 
     def _add_message(self, msg):
-        self._messages.append(msg)
-        self._event.set()
+        if self._messages is not None:
+            self._messages.append(msg)
+            self._event.set()
 
     def _get_message(self):
         try:

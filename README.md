@@ -1,5 +1,5 @@
 # What?
-An asynchronous redis client library for Python 3.7+
+An asynchronous redis client library for Python 3.6+
 
 # Why?
 * All commands are pipelined by default
@@ -41,8 +41,7 @@ import asyncio
 
 async def main():
     # Connect to the default redis port on localhost
-    redis = Multiplexer()
-    try:
+    async with Multiplexer() as redis:
         # Send commands to database #0 (and use by default bytes as utf8 strings decoder)
         db = redis.database(decoder=utf8_bytes_as_strings)
         # Shortcut so you don't have to type long words each time
@@ -57,8 +56,6 @@ async def main():
             m.command(b'SET', 'Hello', 'World!')
             hello = m.command(b'GET', 'Hello')
         print('Atomic Hello, %s' % await hello())
-    finally:
-        await redis.aclose()
 
 
 if __name__ == '__main__':
