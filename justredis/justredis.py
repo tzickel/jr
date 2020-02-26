@@ -562,16 +562,17 @@ class Multiplexer:
     async def __aexit__(self, exc_type, exc_value, traceback):
         await self.aclose()
 
-    # TODO have a closed flag, and stop requesting new connections?
+    # TODO have a closed flag, and stop requesting new connections? (that would remove the lock needed here maybe ?)
+    # TODO should closing this cause clause in pubsub ?
     async def aclose(self):
-        async with self._lock:
-            try:
-                for connection in self._connections.values():
-                    await connection.aclose()
-            except Exception:
-                pass
-            self._connections = {}
-            self._last_connection = None
+        connections = self._connections.values()
+        self._connections = {}
+        self._last_connection = None
+        try:
+            for connection in connections:
+                await connection.aclose()
+        except Exception:
+            pass
 
     def database(self, number=0, encoder=None, decoder=None, retries=3, server=None):
         if number != 0 and self._clustered and server is None:
@@ -579,30 +580,31 @@ class Multiplexer:
         return Database(self, number, encoder, decoder, retries, server)
 
     # TODO support optional server instance for pub/sub ? (for keyspace notification at least)
-    # TODO (async)
-    async def pubsub(self, encoder=None, decoder=None):
+    def pubsub(self, encoder=None, decoder=None):
         if self._pubsub is None:
-            async with self._lock:
-                if self._pubsub is None:
-                    self._pubsub = PubSub(self)
+            self._pubsub = PubSub(self)
         return PubSubInstance(self._pubsub, encoder, decoder)
 
     async def endpoints(self):
         if self._clustered is None:
             await self._get_connection()
-        # TODO is this atomic ?
         if self._clustered:
-            return [x[1] for x in list(self._slots)]
+            return [x[1] for x in self._slots]
         else:
             return list(self._connections.keys())
 
     async def run_commandreply_on_all_masters(self, *args, **kwargs):
         if self._clustered is False:
-            raise RedisError('This command only runs on cluster mode')
+            raise RedisError('This command only runs when conntected to a redis cluster')
         res = {}
         for endpoint in await self.endpoints():
-            res[endpoint] = await self.database(server=endpoint).commandreply(*args, **kwargs)
+            try:
+                res[endpoint] = await self.database(server=endpoint).commandreply(*args, **kwargs)
+            except Exception as e:
+                res[endpoint] = e
         return res
+
+#    async def _get_connection_for_hashslot(self, hashslot):
 
     async def _get_connection(self, hashslot=None):
         if not hashslot:
@@ -628,7 +630,7 @@ class Multiplexer:
                                 try:
                                     if conn:
                                         await conn.aclose()
-                                except:
+                                except Exception:
                                     pass
                                 self._connections.pop(addr, None)
                         self._last_connection = None
@@ -740,7 +742,6 @@ class Multiplexer:
         keyindex = self._command_cache.get(command_name)
         if keyindex is None:
             # Requires redis server 2.8.13 or above
-            # allow retries? might be infinite loop...
             info_cmd = Command((b'COMMAND', b'INFO', command_name))
             # If connection is dead, then the initiator command should retry
             await (await self._get_connection()).send(info_cmd)
