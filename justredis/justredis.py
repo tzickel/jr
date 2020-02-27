@@ -467,6 +467,7 @@ class Command:
     def should_enqueue(self):
         return self._enqueue
 
+    # This function uses ensure_future to not block the recv block of one connection for results from another
     async def set_result(self, result, dont_retry=False):
         try:
             if not isinstance(result, Exception):
@@ -475,7 +476,6 @@ class Command:
                 self._retries -= 1
                 # We will only retry if it's a network I/O or some redis logic
                 if isinstance(result, socket_errors):
-                    #await self._database._multiplexer._send_command(self)
                     ensure_future(self._database._multiplexer._send_command(self))
                     return
                 elif isinstance(result, RedisReplyError):
@@ -486,7 +486,6 @@ class Command:
                         if script:
                             self._data = (b'EVAL', script) + self._data[2:]
                             ensure_future(self._database._multiplexer._send_command(self))
-                            #await self._database._multiplexer._send_command(self)
                             return
                     elif result.args[0].startswith('MOVED'):
                         _, hashslot, addr = result.args[0].split(' ')
@@ -496,7 +495,6 @@ class Command:
                         # TODO is there a better way then doing this like this ?
                         await self._database._multiplexer._update_slots(moved_hint=(hashslot, addr))
                         self._server = addr
-                        #await self._database._multiplexer._send_command(self)
                         ensure_future(self._database._multiplexer._send_command(self))
                         return
                     elif result.args[0].startswith('ASKING'):
@@ -506,7 +504,6 @@ class Command:
                         addr = (addr[0], int(addr[1]))
                         self._asking = True
                         self._server = addr
-                        #await self._database._multiplexer._send_command(self)
                         ensure_future(self._database._multiplexer._send_command(self))
                         return
             # TODO should we call decoder on Exceptions as well ?
@@ -539,13 +536,12 @@ class Command:
 
 
 class Multiplexer:
-#    __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_tryindex', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots'
+    __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots'
 
     def __init__(self, configuration=None):
         self._endpoints, self._configuration = parse_uri(configuration)
         self._connections = {}
         self._last_connection = None
-        self._tryindex = 0
         # The reason we do double dictionary here is for faster lookup in case of lookup failure and multi threading protection
         self._scripts = {}
         self._scripts_sha = {}
@@ -565,14 +561,12 @@ class Multiplexer:
     # TODO have a closed flag, and stop requesting new connections? (that would remove the lock needed here maybe ?)
     # TODO should closing this cause clause in pubsub ?
     async def aclose(self):
-        connections = self._connections.values()
+        connections = list(self._connections.values())
         self._connections = {}
         self._last_connection = None
-        try:
-            for connection in connections:
-                await connection.aclose()
-        except Exception:
-            pass
+        for connection in connections:
+            # connection.aclose should not throw an exception
+            await connection.aclose()
 
     def database(self, number=0, encoder=None, decoder=None, retries=3, server=None):
         if number != 0 and self._clustered and server is None:
@@ -604,62 +598,71 @@ class Multiplexer:
                 res[endpoint] = e
         return res
 
-#    async def _get_connection_for_hashslot(self, hashslot):
-
-    async def _get_connection(self, hashslot=None):
+    # TODO maybe make an internal loop instead of _retry ?
+    async def _get_connection_for_hashslot(self, hashslot, _retry=True):
         if not hashslot:
+            raise RedisError('Do not call _get_connection_for_hashslot without an hashslot')
+        if not self._slots:
+            await self._update_slots()
+        if not self._slots:
+            raise RedisError('Could not find any slots in redis cluster')
+        for slot in self._slots:
+            # TODO flip logic ?
+            if hashslot > slot[0]:
+                continue
+            break
+        addr = slot[1]
+        try:
+            return await self._get_connection(addr)
+        except Exception:
+            if _retry:
+                # We are retrying here once in case of an exception, because maybe the world view has changed
+                return await self._get_connection_for_hashslot(hashslot, False)
+            else:
+                raise
+
+    # TODO async locks are not re-entrant, validate all code path to this function is not recursive
+    async def _get_connection(self, addr=None):
+        if addr:
+            conn = self._connections.get(addr)
+            if not conn or conn.closed:
+                # TODO per addr lock here?
+                async with self._lock:
+                    conn = self._connections.get(addr)
+                    if not conn or conn.closed:
+                        conn = await Connection.create(addr, self._configuration)
+                        self._connections[addr] = conn
+            return conn
+        else:
+            # TODO should we round-robin ?
             if self._last_connection is None or self._last_connection.closed:
                 async with self._lock:
                     if self._last_connection is None or self._last_connection.closed:
-                        # TODO should we enumerate self._uri or self.connections (which is not populated, maybe populate at start and avoid cluster problems)
-                        for num, addr in enumerate(list(self._endpoints)):
-                            self._tryindex = num
+                        # TODO should we enumerate self._endpoints or self.connections (which is not populated, maybe populate at start and avoid cluster problems)
+                        # TODO should we keep an index of failed indexes, and start to resume from the last failed one the next time (_tryindex) ?
+                        if not self._endpoints:
+                            raise RedisError('endpoints list is empty')
+                        for addr in list(self._endpoints):
                             try:
                                 conn = self._connections.get(addr)
                                 if not conn or conn.closed:
                                     conn = await Connection.create(addr, self._configuration)
                                     # TODO is the name correct here? (in ipv4 yes, in ipv6 no ?)
                                     self._last_connection = self._connections[conn.name] = conn
-                                    self._last_connection = conn
                                     # TODO reset each time?
                                     if self._clustered is None:
                                         await self._update_slots(with_connection=conn)
                                     return conn
                             except Exception as e:
                                 exp = e
-                                try:
-                                    if conn:
-                                        await conn.aclose()
-                                except Exception:
-                                    pass
+                                if conn:
+                                    await conn.aclose()
                                 self._connections.pop(addr, None)
                         self._last_connection = None
                         raise exp
             return self._last_connection
-        else:
-            if not self._slots:
-                await self._update_slots()
-            for slot in self._slots:
-                if hashslot > slot[0]:
-                    continue
-                break
-            addr = slot[1]
-            try:
-                conn = self._connections.get(addr)
-                if not conn or conn.closed:
-                    #TODO lock per conn
-                    async with self._lock:
-                        conn = self._connections.get(addr)
-                        if not conn or conn.closed:
-                            conn = await Connection.create(addr, self._configuration)
-                            self._connections[addr] = conn
-                return conn
-            # TODO (misc) should we try getting another connection here ?
-            except Exception:
-                await self._update_slots()
-                raise
 
-    # TODO check if closed and dont allow
+    # TODO check if closed and dont allow? (or restart)
     async def _send_command(self, cmd):
         server = cmd._server
         if not server:
@@ -670,18 +673,13 @@ class Multiplexer:
                         break
             else:
                 hashslot = await self._get_command_from_cache(cmd)
-            connection = await self._get_connection(hashslot)
+            if hashslot is None:
+                connection = await self._get_connection()
+            else:
+                connection = await self._get_connection_for_hashslot(hashslot)
         else:
             try:
-                conn = self._connections.get(server)
-                if not conn or conn.closed:
-                    #TODO lock per conn
-                    async with self._lock:
-                        conn = self._connections.get(server)
-                        if not conn or conn.closed:
-                            conn = await Connection.create(server, self._configuration)
-                            self._connections[server] = conn
-                connection = conn
+                connection = await self._get_connection(server)
             # TODO (misc) should we try getting another connection here ?
             except Exception:
                 await self._update_slots()
@@ -705,6 +703,7 @@ class Multiplexer:
                 return
         try:
             # multiple commands can trigger this while in queue so we make sure to do it once
+            # also against race condition with self._get_connection() calling us,
             self._already_asking_for_slots = True
             # TODO should we retry on some type of errors ?
             cmd = Command((b'CLUSTER', b'SLOTS'))
@@ -714,14 +713,15 @@ class Multiplexer:
             try:
                 slots = await cmd()
                 self._clustered = True
+            # TODO any exception type ?
             except RedisReplyError:
                 slots = []
                 self._clustered = False
             slots.sort(key=lambda x: x[0])
             slots = [(x[1], (x[2][0].decode(), x[2][1])) for x in slots]
-            # release hosts not here from previous connections
-            # TODO wtf, how did this work before without this if ?s
+            # TODO If we are not in a cluster now ?
             if self._clustered:
+                # release hosts not here from previous connections
                 remove_connections = set(self._connections) - set([x[1] for x in slots])
                 for entry in remove_connections:
                     try:

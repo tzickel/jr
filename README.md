@@ -13,9 +13,11 @@ An asynchronous redis client library for Python 3.6+
 * Hiredis parser (required)
 * Testing with private redis server and cluster
 
-# Inherit limitations (can be solved with a connection pool on top of current code)
+# Inherit limitations
 * Cannot issue blocking commands (such as BLPOP)
 * Cannot issue transaction commands with WATCH (but MULTI and EXEC can be used)
+
+This issues can be solved by writing a connection pool ontop of existing API.
 
 # Roadmap
 - [ ] API Finalization
