@@ -604,7 +604,7 @@ class Multiplexer:
         return res
 
     # TODO maybe make an internal loop instead of _retry ?
-    async def _get_connection_for_hashslot(self, hashslot, _retry=True):
+    async def _get_connection_for_hashslot(self, hashslot, _retry=True, is_slow=False):
         if not hashslot:
             raise RedisError('Do not call _get_connection_for_hashslot without an hashslot')
         if not self._slots:
@@ -618,16 +618,18 @@ class Multiplexer:
             break
         addr = slot[1]
         try:
-            return await self._get_connection(addr)
+            return await self._get_connection(addr, is_slow=is_slow)
         except Exception:
             if _retry:
                 # We are retrying here once in case of an exception, because maybe the world view has changed
-                return await self._get_connection_for_hashslot(hashslot, False)
+                return await self._get_connection_for_hashslot(hashslot, False, is_slow)
             else:
                 raise
 
     # TODO async locks are not re-entrant, validate all code path to this function is not recursive
-    async def _get_connection(self, addr=None):
+    async def _get_connection(self, addr=None, is_slow=False):
+#        if is_slow:
+#            raise RedisError('Please use a connection pool for blocking or slow commands')
         if addr:
             conn = self._connections.get(addr)
             if not conn or conn.closed:
@@ -671,20 +673,23 @@ class Multiplexer:
     async def _send_command(self, cmd):
         server = cmd._server
         if not server:
-            if isinstance(cmd, MultiCommand) and self._clustered is not False:
+            if isinstance(cmd, MultiCommand):
                 for acmd in cmd._cmds[1:-1]:
-                    hashslot = await self._get_command_from_cache(acmd)
+                    keyindex, is_slow = await self._get_command_from_cache(acmd)
+                    hashslot = self._get_hashslot_for_keyindex(acmd, keyindex)
                     if hashslot is not None:
                         break
             else:
-                hashslot = await self._get_command_from_cache(cmd)
-            if hashslot is None:
-                connection = await self._get_connection()
+                keyindex, is_slow = await self._get_command_from_cache(cmd)
+                hashslot = self._get_hashslot_for_keyindex(cmd, keyindex)
+            if hashslot is None or self._clustered is False:
+                connection = await self._get_connection(is_slow=is_slow)
             else:
-                connection = await self._get_connection_for_hashslot(hashslot)
+                connection = await self._get_connection_for_hashslot(hashslot, is_slow=is_slow)
         else:
             try:
-                connection = await self._get_connection(server)
+                keyindex, is_slow = await self._get_command_from_cache(cmd)
+                connection = await self._get_connection(server, is_slow=is_slow)
             # TODO (misc) should we try getting another connection here ?
             except Exception:
                 await self._update_slots()
@@ -741,22 +746,31 @@ class Multiplexer:
     # It is unreasonable to expect the user to provide us with the key index for each command so we ask the server and cache it
     # TODO what to do in MULTI case ? maybe this should be in Command itself
     async def _get_command_from_cache(self, cmd):
-        if self._clustered is False:
-            return None
+#        if self._clustered is False:
+#            return None
         command_name = cmd.get_index_as_bytes(0)
-        keyindex = self._command_cache.get(command_name)
-        if keyindex is None:
+        data = self._command_cache.get(command_name)
+        if data is None:
             # Requires redis server 2.8.13 or above
             info_cmd = Command((b'COMMAND', b'INFO', command_name))
             # If connection is dead, then the initiator command should retry
             await (await self._get_connection()).send(info_cmd)
             # We do this check here, since _get_connection first try will trigger a clustred check and we need to abort if it's not (to not trigger the send_command's hashslot)
-            if self._clustered is False:
-                return None
+#            if self._clustered is False:
+#                return None
             cmdinfo = (await info_cmd())[0]
             # If the server does not know the command, we can't redirect it properly in cluster mode
-            keyindex = cmdinfo[3] if cmdinfo else 0
-            self._command_cache[command_name] = keyindex
+            if cmdinfo:
+                keyindex = cmdinfo[3]
+                is_slow = b'noscript' in cmdinfo[2]
+            else:
+                keyindex = 0
+                is_slow = False
+            data = (keyindex, is_slow)
+            self._command_cache[command_name] = data
+        return data
+
+    def _get_hashslot_for_keyindex(self, cmd, keyindex):
         if keyindex == 0:
             return None
         try:
@@ -764,7 +778,6 @@ class Multiplexer:
         except IndexError:
             return None
         return calc_hash(key)
-
 
 class Database:
     __slots__ = '_multiplexer', '_number', '_encoder', '_decoder', '_retries', '_server', '_scripts', '_scripts_sha'
@@ -803,7 +816,7 @@ class MultiCommand:
         self._cmds = []
         self._done = False
         self._asking = False
-    
+
     def ready_to_await(self):
         for cmd in self._cmds:
             cmd.ready_to_await()
