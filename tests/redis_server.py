@@ -1,9 +1,8 @@
-import subprocess
-import random
-import sys
 import os
+import random
 import signal
-
+import subprocess
+import sys
 
 platform = ''
 if sys.platform.startswith('linux'):

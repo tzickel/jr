@@ -1,7 +1,9 @@
 import asyncio
-import unittest
 import functools
+import unittest
+
 from justredis import Multiplexer, RedisError, RedisReplyError, utf8_bytes_as_strings
+
 from .redis_server import RedisServer, start_cluster
 
 

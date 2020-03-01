@@ -1,10 +1,12 @@
-from asyncio import Lock, Event, open_connection, open_unix_connection, ensure_future, wait_for, TimeoutError as AsyncIOTimeoutError
 import socket
 import sys
-from collections import deque
-from hashlib import sha1
+from asyncio import Event, Lock
+from asyncio import TimeoutError as AsyncIOTimeoutError
+from asyncio import ensure_future, open_connection, open_unix_connection, wait_for
 # binascii requires python to be compiled with zlib ?
 from binascii import crc_hqx
+from collections import deque
+from hashlib import sha1
 
 import hiredis
 
