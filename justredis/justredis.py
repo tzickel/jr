@@ -45,7 +45,8 @@ elif sys.platform.startswith('win'):
 
 
 # TODO populate this list dynamically from command info ?
-not_allowed_commands = set((b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
+#not_allowed_commands = set((b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
+not_allowed_commands = set((b'MULTI', b'EXEC', b'DISCARD', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
 
 
 # Basic encoder
@@ -628,8 +629,8 @@ class Multiplexer:
 
     # TODO async locks are not re-entrant, validate all code path to this function is not recursive
     async def _get_connection(self, addr=None, is_slow=False):
-#        if is_slow:
-#            raise RedisError('Please use a connection pool for blocking or slow commands')
+        if is_slow:
+            raise RedisError('Please use a connection pool for blocking or slow commands')
         if addr:
             conn = self._connections.get(addr)
             if not conn or conn.closed:
@@ -778,6 +779,60 @@ class Multiplexer:
         except IndexError:
             return None
         return calc_hash(key)
+
+
+class MultiplexerPool(Multiplexer):
+    # TODO have a closed flag, and stop requesting new connections? (that would remove the lock needed here maybe ?)
+    # TODO should closing this cause clause in pubsub ?
+    async def aclose(self):
+        connections = list(self._connections.values())
+        self._connections = {}
+        self._last_connection = None
+        for connection in connections:
+            # connection.aclose should not throw an exception
+            await connection.aclose()
+    
+    async def _get_connection(self, addr=None, is_slow=False):
+#        if is_slow:
+#            raise RedisError('Please use a connection pool for blocking or slow commands')
+        if addr:
+            conn = self._connections.get(addr)
+            if not conn or conn.closed:
+                # TODO per addr lock here?
+                async with self._lock:
+                    conn = self._connections.get(addr)
+                    if not conn or conn.closed:
+                        conn = await Connection.create(addr, self._configuration)
+                        self._connections[addr] = conn
+            return conn
+        else:
+            # TODO should we round-robin ?
+            if self._last_connection is None or self._last_connection.closed:
+                async with self._lock:
+                    if self._last_connection is None or self._last_connection.closed:
+                        # TODO should we enumerate self._endpoints or self.connections (which is not populated, maybe populate at start and avoid cluster problems)
+                        # TODO should we keep an index of failed indexes, and start to resume from the last failed one the next time (_tryindex) ?
+                        if not self._endpoints:
+                            raise RedisError('endpoints list is empty')
+                        for addr in list(self._endpoints):
+                            try:
+                                conn = self._connections.get(addr)
+                                if not conn or conn.closed:
+                                    conn = await Connection.create(addr, self._configuration)
+                                    # TODO is the name correct here? (in ipv4 yes, in ipv6 no ?)
+                                    self._last_connection = self._connections[conn.name] = conn
+                                    # TODO reset each time?
+                                    if self._clustered is None:
+                                        await self._update_slots(with_connection=conn)
+                                    return conn
+                            except Exception as e:
+                                exp = e
+                                if conn:
+                                    await conn.aclose()
+                                self._connections.pop(addr, None)
+                        self._last_connection = None
+                        raise exp
+            return self._last_connection        
 
 class Database:
     __slots__ = '_multiplexer', '_number', '_encoder', '_decoder', '_retries', '_server', '_scripts', '_scripts_sha'

@@ -2,8 +2,7 @@ import asyncio
 import functools
 import unittest
 
-from justredis import Multiplexer, RedisError, RedisReplyError, utf8_bytes_as_strings
-
+from justredis import Multiplexer, MultiplexerPool, RedisError, RedisReplyError, utf8_bytes_as_strings
 from .redis_server import RedisServer, start_cluster
 
 
@@ -17,7 +16,7 @@ def asynctest(asyncfunc):
 class TestServerWithPassword(unittest.TestCase):
     def setUp(self):
         self.server = RedisServer(extraparams='--requirepass blah')
-        self.mp = Multiplexer({'endpoints': ('localhost', self.server.port), 'password': 'blah'})
+        self.mp = MultiplexerPool({'endpoints': ('localhost', self.server.port), 'password': 'blah'})
         self.c0 = self.mp.database(0).command
         self.cr0 = self.mp.database(0).commandreply
 
@@ -32,10 +31,10 @@ class TestServerWithPassword(unittest.TestCase):
 
     @asynctest
     async def test_wrongpassword(self):
-        mp = Multiplexer({'endpoints': ('localhost', self.server.port), 'password': 'wrong'})
+        mp = MultiplexerPool({'endpoints': ('localhost', self.server.port), 'password': 'wrong'})
         with self.assertRaises(RedisReplyError):
             await mp.database(0).commandreply(b'GET', b'a')
-        mp = Multiplexer({'endpoints': ('localhost', self.server.port)})
+        mp = MultiplexerPool({'endpoints': ('localhost', self.server.port)})
         with self.assertRaises(RedisReplyError):
             await mp.database(0).commandreply(b'GET', b'a')
         self.assertEqual(await self.cr0(b'GET', b'a'), None)
@@ -131,12 +130,20 @@ class TestServerWithPassword(unittest.TestCase):
         with self.assertRaises(RedisReplyError):
             await cmd()
 
+    @asynctest
+    async def test_notallowed(self):
+        return
+        with self.assertRaises(RedisError):
+            await self.cr0(b'DISCARD')
+        with self.assertRaises(RedisError):
+            await self.cr0(b'BLPOP', 'a', '0')
+
 
 class TestCluster(unittest.TestCase):
     @asynctest
     async def setUp(self):
         self.servers = start_cluster(3)
-        self.mp = Multiplexer({'endpoints': ('127.0.0.1', self.servers[0].port)})
+        self.mp = MultiplexerPool({'endpoints': ('127.0.0.1', self.servers[0].port)})
         self.c0 = self.mp.database().command
         self.cr0 = self.mp.database().commandreply
         # Sometimes it takes awhile for the cluster to be ready
@@ -218,7 +225,7 @@ class TestCluster(unittest.TestCase):
 class TestPubSub(unittest.TestCase):
     def setUp(self):
         self.server = RedisServer()
-        self.mp = Multiplexer({'endpoints': ('localhost', self.server.port)})
+        self.mp = MultiplexerPool({'endpoints': ('localhost', self.server.port)})
 
     @asynctest
     async def tearDown(self):
