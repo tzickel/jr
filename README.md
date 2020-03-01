@@ -8,13 +8,11 @@ Please note that this project is currently alpha quality and the API is not fina
 
 Since most Redis server commands are intended to be run for a short time on the server, sometimes you pay more time on network latency than execution time. By splitting the sending and receiving parts into seperate coroutines all commands are sent seperately from waiting for their response.
 
-### No connection pool, one socket connection per instance (another extra for pub/sub)
+### Transparent connection pooling and connection multiplexing
 
-Building on the first point, you can multiplex multiple coroutinues that want to communicate with a Redis server together. Each multiplexer maintains a single socket per server.
+You have an option to use a Multiplexer which can multiplex multiple coroutinues that want to communicate with a Redis server together in one single socket per server.
 
-This poses some restrictions and thus blocking commands (such as BLPOP) or statefull commands (such as WATCH, but not regular MULTI and EXEC transactions) cannot be used.
-
-A connection pool can be built on top of the multiplexer which will manage multiple connections and allow for such commands.
+Or use a MultiplexerPool which can also support slow and blocking commands (transparently).
 
 ### Transparent Redis Cluster support
 

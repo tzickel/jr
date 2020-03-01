@@ -782,16 +782,9 @@ class Multiplexer:
 
 
 class MultiplexerPool(Multiplexer):
-    # TODO have a closed flag, and stop requesting new connections? (that would remove the lock needed here maybe ?)
-    # TODO should closing this cause clause in pubsub ?
-    async def aclose(self):
-        connections = list(self._connections.values())
-        self._connections = {}
-        self._last_connection = None
-        for connection in connections:
-            # connection.aclose should not throw an exception
-            await connection.aclose()
-    
+    def __init__(self, configuration=None):
+        super(MultiplexerPool, self).__init__(configuration)
+
     async def _get_connection(self, addr=None, is_slow=False):
 #        if is_slow:
 #            raise RedisError('Please use a connection pool for blocking or slow commands')
@@ -833,6 +826,7 @@ class MultiplexerPool(Multiplexer):
                         self._last_connection = None
                         raise exp
             return self._last_connection        
+
 
 class Database:
     __slots__ = '_multiplexer', '_number', '_encoder', '_decoder', '_retries', '_server', '_scripts', '_scripts_sha'
