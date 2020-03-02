@@ -220,7 +220,7 @@ async def async_with_timeout(fut, timeout=None):
 
 
 class Connection:
-    __slots__ = 'reader', 'writer', 'buffersize', 'timeout', 'name', 'commands', 'closed', 'chunk_send_size', 'parser', 'lastdatabase', '_pubsub_cb', 'thread', 'cleanedup'
+    __slots__ = 'reader', 'writer', 'buffersize', 'timeout', 'name', 'commands', 'closed', 'chunk_send_size', 'parser', 'lastdatabase', '_pubsub_cb', '_release_cb', 'thread', 'cleanedup'
 
     @classmethod
     async def create(cls, endpoint, config={}):
@@ -286,6 +286,7 @@ class Connection:
         self.parser.send(None)
         self.lastdatabase = 0
         self._pubsub_cb = None
+        self._release_cb = None
         # Using ensure_future and not create_task for Python 3.6 compatability
         self.thread = ensure_future(self._loop())
         self.cleanedup = False
@@ -320,6 +321,8 @@ class Connection:
                     result = [result]
                 # Since this can block the recv loop, inside it actually calls ensure_future to not block this loop
                 await cmd.set_result(result)
+                if self._release_cb:
+                    self._release_cb(self)
                 # TODO should we call this here ?
                 #await self.writer.drain()
                 result = None
@@ -333,6 +336,9 @@ class Connection:
             await self.aclose()
             if cmd:
                 await cmd.set_result(e, dont_retry=True)
+            # TODO this can't be called twice, because we do it in the end, if an exception happened it's surely before ?
+            if self._release_cb:
+                self._release_cb(self)
             # TODO (async) is there any point in throwing this exception here ?
             #raise
 
@@ -430,6 +436,9 @@ class Connection:
 
     def set_pubsub_cb(self, cb):
         self._pubsub_cb = cb
+    
+    def set_release_cb(self, cb):
+        self._release_cb = cb
 
 
 class Command:
@@ -779,53 +788,6 @@ class Multiplexer:
         except IndexError:
             return None
         return calc_hash(key)
-
-
-class MultiplexerPool(Multiplexer):
-    def __init__(self, configuration=None):
-        super(MultiplexerPool, self).__init__(configuration)
-
-    async def _get_connection(self, addr=None, is_slow=False):
-#        if is_slow:
-#            raise RedisError('Please use a connection pool for blocking or slow commands')
-        if addr:
-            conn = self._connections.get(addr)
-            if not conn or conn.closed:
-                # TODO per addr lock here?
-                async with self._lock:
-                    conn = self._connections.get(addr)
-                    if not conn or conn.closed:
-                        conn = await Connection.create(addr, self._configuration)
-                        self._connections[addr] = conn
-            return conn
-        else:
-            # TODO should we round-robin ?
-            if self._last_connection is None or self._last_connection.closed:
-                async with self._lock:
-                    if self._last_connection is None or self._last_connection.closed:
-                        # TODO should we enumerate self._endpoints or self.connections (which is not populated, maybe populate at start and avoid cluster problems)
-                        # TODO should we keep an index of failed indexes, and start to resume from the last failed one the next time (_tryindex) ?
-                        if not self._endpoints:
-                            raise RedisError('endpoints list is empty')
-                        for addr in list(self._endpoints):
-                            try:
-                                conn = self._connections.get(addr)
-                                if not conn or conn.closed:
-                                    conn = await Connection.create(addr, self._configuration)
-                                    # TODO is the name correct here? (in ipv4 yes, in ipv6 no ?)
-                                    self._last_connection = self._connections[conn.name] = conn
-                                    # TODO reset each time?
-                                    if self._clustered is None:
-                                        await self._update_slots(with_connection=conn)
-                                    return conn
-                            except Exception as e:
-                                exp = e
-                                if conn:
-                                    await conn.aclose()
-                                self._connections.pop(addr, None)
-                        self._last_connection = None
-                        raise exp
-            return self._last_connection        
 
 
 class Database:
