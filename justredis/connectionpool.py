@@ -7,14 +7,17 @@ from .justredis import Connection
 
 # TODO remove old expire items
 # TODO use a queue ?
+# TODO slots
+# TODO take maxxconnections from configuration
 class ConnectionPool:
-    def __init__(self, factory, maxconnections):
-        self._available = deque()
-        self._inuse = deque()
-        self._factory = factory
+    def __init__(self, addr, configuration, maxconnections):
+        self._addr = addr
+        self._configuration = configuration
         if not maxconnections:
             raise Exception('Please set a maximum limit of connections in the pool')
         self._limit = Semaphore(maxconnections)
+        self._available = deque()
+        self._inuse = deque()
         self._fast = None
         self._lock = Lock()
 
@@ -23,8 +26,7 @@ class ConnectionPool:
             if self._fast is None or self._fast.closed:
                 async with self._lock:
                     if self._fast is None or self._fast.closed:
-                        # TODO don't release here
-                        self._fast = await self._factory()
+                        self._fast = await Connection.create(self._addr, self._configuration)
             return self._fast
         else:
             try:
@@ -36,48 +38,47 @@ class ConnectionPool:
                 if timeout is None:
                     await self._limit.acquire()
                 else:
-                    wait_for(self._limit.acquire(), timeout)
-                conn = await self._factory(self.release)
-    #        print('put', conn)
-    #        self._inuse.append(conn)
+                    await wait_for(self._limit.acquire(), timeout)
+                try:
+                    conn = await Connection.create(self._addr, self._configuration)
+                    conn.set_release_cb(self.release)
+                except:
+                    self._limit.release()
+                    raise
+            self._inuse.append(conn)
             return conn
 
     def release(self, conn):
         # TODO is this the best option ?
-#        print('remove', conn)
-#        self._inuse.remove(conn)
+        self._inuse.remove(conn)
         if not conn.closed:
             self._available.append(conn)
         self._limit.release()
 
     async def aclose(self):
+        if self._fast:
+            await self._fast.aclose()
+            self._fast = None
         if self._available is not None and self._inuse is not None:
             tmp = list(self._available) + list(self._inuse)
             for conn in tmp:
                 await conn.aclose()
+            self._addr = None
+            self._configuration = None
             self._limit = None
-            self._factory = None
             self._available = None
             self._inuse = None
+            self._lock = None
 
 
 class MultiplexerPool(Multiplexer):
-    def __init__(self, configuration=None):
+    def __init__(self, configuration={}):
         super(MultiplexerPool, self).__init__(configuration)
-
-    def new_connection(self, addr, is_slow):
-        async def factory(release_func, addr=addr, is_slow=is_slow):
-            conn = await Connection.create(addr, self._configuration)
-            if is_slow:
-                conn.set_release_cb(release_func)
-            return conn
-        return ConnectionPool(factory, 10)
+        self._maxconnections = configuration.get('maxconections', 10)
 
     async def _get_connection(self, addr=None, is_slow=False):
         if addr:
-            pool = self._connections.get(addr)
-            if pool is None:
-                pool = self._connections[addr] = self.new_connection(addr)
+            pool = self._connections.setdefault(addr, ConnectionPool(addr, self._configuration, self._maxconnections))
             return await pool.take(is_slow)
         else:
             # TODO should we round-robin ?
@@ -91,15 +92,15 @@ class MultiplexerPool(Multiplexer):
                         pool = self._connections.get(addr)
                         if not pool:
                             # TODO is the name correct here? (in ipv4 yes, in ipv6 no ?)
-                            self._last_connection = pool = self._connections[addr] = self.new_connection(addr)
+                            self._last_connection = pool = self._connections[addr] = ConnectionPool(addr, self._configuration, self._maxconnections)
                             # TODO reset each time?
                             if self._clustered is None:
                                 await self._update_slots(with_connection=await pool.take(is_slow))
                         return await pool.take(is_slow)
                     except Exception as e:
                         exp = e
-                        if conn:
-                            await conn.aclose()
+                        if pool:
+                            await pool.aclose()
                         self._connections.pop(addr, None)
                 self._last_connection = None
                 raise exp
