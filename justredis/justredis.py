@@ -256,7 +256,6 @@ class Connection:
             except connect_errors as e:
                 connectretry -= 1
                 if not connectretry:
-                    # TODO is this the correct way?
                     raise RedisError('Connection failed') from e
         # needed for cluster support
         self.name = self.writer.get_extra_info('peername')

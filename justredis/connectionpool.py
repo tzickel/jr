@@ -5,7 +5,7 @@ from . import Multiplexer, RedisError
 from .justredis import Connection
 
 
-# TODO add minimumconnections ? remove old expire items ?
+# TODO add minconnections ? remove old expired connections ?
 # TODO is the self._limit semaphore being counted correctly ?
 class ConnectionPool:
     def __init__(self, addr, configuration, maxconnections):
@@ -48,16 +48,12 @@ class ConnectionPool:
             return conn
 
     def release(self, conn):
-        try:
-            self._inuse.remove(conn)
-            if not conn.closed:
-                self._available.append(conn)
-            else:
-                self._limit.release()
-        # This can happen if removing will call a double release
-        except KeyError:
+        # This can fail, if somehow (a bug) release is called twice without take.
+        self._inuse.remove(conn)
+        if not conn.closed:
+            self._available.append(conn)
+        else:
             self._limit.release()
-
 
     async def aclose(self):
         if self._fast:
@@ -75,13 +71,14 @@ class ConnectionPool:
             self._lock = None
 
 
-not_allowed_commands = set((b'MULTI', b'EXEC', b'DISCARD', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
+# This commands are handled by a higher level API and should not be called directly
+not_allowed_commands = set((b'WATCH', b'MULTI', b'EXEC', b'DISCARD', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
 
 
 class MultiplexerPool(Multiplexer):
     def __init__(self, configuration={}):
         super(MultiplexerPool, self).__init__(configuration)
-        self._maxconnections = configuration.get('maxconections', 10)
+        self._maxconnections = configuration.get('maxconnections', 10)
         self._not_allowed_commands = not_allowed_commands
 
     # TODO maybe refactor this into the main Multiplexer._get_connection ?
