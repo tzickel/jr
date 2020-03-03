@@ -10,12 +10,8 @@ from hashlib import sha1
 
 import hiredis
 
-# TODO are asyncio locks reantrent ?
-# TODO (async) make the per command event, a pool and reuse them...
-# TODO (async) implment context manager for all ?
-# TODO (async) think about cancelation and sheilding
-# TODO trio ? thread-safety ?
-# TODO rego over the multiplexer code (especially for recursive locks)
+# Things to check for:
+# asyncio locks are not reentrant so do not create code path which can double lock an lock.
 
 
 # Exceptions
@@ -668,7 +664,7 @@ class Multiplexer:
                                     conn = await Connection.create(addr, self._configuration)
                                     # TODO is the name correct here? (in ipv4 yes, in ipv6 no ?)
                                     self._last_connection = self._connections[conn.name] = conn
-                                    # TODO reset each time?
+                                    # TODO reset each time? (i.e. if we move from a clustered server to a non clustered one)
                                     if self._clustered is None:
                                         await self._update_slots(with_connection=conn)
                                     return conn

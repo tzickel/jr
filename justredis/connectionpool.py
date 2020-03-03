@@ -48,7 +48,7 @@ class ConnectionPool:
             return conn
 
     def release(self, conn):
-        # This can fail, if somehow (a bug) release is called twice without take.
+        # This is also a protection against double .release call on a single .take call
         self._inuse.remove(conn)
         if not conn.closed:
             self._available.append(conn)
@@ -72,7 +72,7 @@ class ConnectionPool:
 
 
 # This commands are handled by a higher level API and should not be called directly
-not_allowed_commands = set((b'WATCH', b'MULTI', b'EXEC', b'DISCARD', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
+not_allowed_commands = set((b'WATCH', b'MULTI', b'EXEC', b'DISCARD', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE', b'MONITOR'))
 
 
 class MultiplexerPool(Multiplexer):
@@ -81,11 +81,10 @@ class MultiplexerPool(Multiplexer):
         self._maxconnections = configuration.get('maxconnections', 10)
         self._not_allowed_commands = not_allowed_commands
 
-    # TODO maybe refactor this into the main Multiplexer._get_connection ?
+    # TODO this should be refactored into the main Multiplexer._get_connection
     async def _get_connection(self, addr=None, is_slow=False):
         if addr:
-            pool = self._connections.setdefault(addr, ConnectionPool(addr, self._configuration, self._maxconnections))
-            return await pool.take(is_slow)
+            return await self._connections.setdefault(addr, ConnectionPool(addr, self._configuration, self._maxconnections)).take(is_slow)
         else:
             # TODO should we round-robin ?
             if self._last_connection is None:
@@ -99,7 +98,7 @@ class MultiplexerPool(Multiplexer):
                         if not pool:
                             # TODO is the name correct here? (in ipv4 yes, in ipv6 no ?)
                             self._last_connection = pool = self._connections[addr] = ConnectionPool(addr, self._configuration, self._maxconnections)
-                            # TODO reset each time?
+                            # TODO reset each time? (i.e. if we move from a clustered server to a non clustered one)
                             if self._clustered is None:
                                 await self._update_slots(with_connection=await pool.take(is_slow))
                         return await pool.take(is_slow)

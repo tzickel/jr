@@ -46,13 +46,13 @@ Replace master with the specific branch or version tag you want.
 
 ## Examples
 ```python
-from justredis import Multiplexer, utf8_bytes_as_strings
+from justredis import MultiplexerPool, utf8_bytes_as_strings
 import asyncio
 
 
 async def main():
     # Connect to the default redis port on localhost
-    async with Multiplexer() as redis:
+    async with MultiplexerPool() as redis:
         # Send commands to database #0 (and decode the results as utf-8 strings instead of bytes)
         db = redis.database(decoder=utf8_bytes_as_strings)
         # Shortcut so you don't have to type long words each time
@@ -68,6 +68,11 @@ async def main():
             hello = m.command(b'GET', 'Hello')
         print('Atomic Hello, %s' % await hello())
 
+        # This shows support in the Pooled multiplexer for blocking commands.
+        waiting = await c(b'BLPOP', 'queue', 0)
+        await cr(b'RPUSH', 'queue', 'Hello, World!')
+        print('Queued %s' % (await waiting())[1])
+
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
@@ -81,7 +86,7 @@ You can check the [tests](tests/test.py) for some more examples such as pub/sub 
 This is all the API in a nutshell:
 
 ```python
-Multiplexer(configuration=None)
+MultiplexerPool(configuration=None) or Multiplexer(configuration=None)
   async __aenter__()
   async __aexit__()
   async aclose()
