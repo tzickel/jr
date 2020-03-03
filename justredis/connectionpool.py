@@ -5,10 +5,8 @@ from . import Multiplexer, RedisError
 from .justredis import Connection
 
 
-# TODO remove old expire items
-# TODO use a queue ?
-# TODO slots
-# TODO take maxxconnections from configuration
+# TODO add minimumconnections ? remove old expire items ?
+# TODO is the self._limit semaphore being counted correctly ?
 class ConnectionPool:
     def __init__(self, addr, configuration, maxconnections):
         self._addr = addr
@@ -17,7 +15,7 @@ class ConnectionPool:
             raise Exception('Please set a maximum limit of connections in the pool')
         self._limit = Semaphore(maxconnections)
         self._available = deque()
-        self._inuse = deque()
+        self._inuse = set()
         self._fast = None
         self._lock = Lock()
 
@@ -34,6 +32,7 @@ class ConnectionPool:
                     conn = self._available.popleft()
                     if not conn.closed:
                         break
+                    self._limit.release()
             except IndexError:
                 if timeout is None:
                     await self._limit.acquire()
@@ -45,15 +44,20 @@ class ConnectionPool:
                 except:
                     self._limit.release()
                     raise
-            self._inuse.append(conn)
+            self._inuse.add(conn)
             return conn
 
     def release(self, conn):
-        # TODO is this the best option ?
-        self._inuse.remove(conn)
-        if not conn.closed:
-            self._available.append(conn)
-        self._limit.release()
+        try:
+            self._inuse.remove(conn)
+            if not conn.closed:
+                self._available.append(conn)
+            else:
+                self._limit.release()
+        # This can happen if removing will call a double release
+        except KeyError:
+            self._limit.release()
+
 
     async def aclose(self):
         if self._fast:
@@ -71,11 +75,16 @@ class ConnectionPool:
             self._lock = None
 
 
+not_allowed_commands = set((b'MULTI', b'EXEC', b'DISCARD', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
+
+
 class MultiplexerPool(Multiplexer):
     def __init__(self, configuration={}):
         super(MultiplexerPool, self).__init__(configuration)
         self._maxconnections = configuration.get('maxconections', 10)
+        self._not_allowed_commands = not_allowed_commands
 
+    # TODO maybe refactor this into the main Multiplexer._get_connection ?
     async def _get_connection(self, addr=None, is_slow=False):
         if addr:
             pool = self._connections.setdefault(addr, ConnectionPool(addr, self._configuration, self._maxconnections))

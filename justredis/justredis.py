@@ -45,8 +45,7 @@ elif sys.platform.startswith('win'):
 
 
 # TODO populate this list dynamically from command info ?
-#not_allowed_commands = set((b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
-not_allowed_commands = set((b'MULTI', b'EXEC', b'DISCARD', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
+not_allowed_commands_with_blocking = set((b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
 
 
 # Basic encoder
@@ -188,8 +187,10 @@ def parse_command(source, *args, **kwargs):
     # TODO First argument should always be utf-8 encoded english?
     cmd = args[0]
     cmd = (cmd if isinstance(cmd, bytes) else cmd.encode()).upper()
-    if cmd in not_allowed_commands:
-        raise RedisError('Command is not allowed by this client')
+    if source and source._multiplexer:
+        not_allowed_commands = source._multiplexer._not_allowed_commands
+        if cmd in not_allowed_commands:
+            raise RedisError('Command is not allowed by this client')
     encoder = source._encoder
     decoder = source._decoder
     throw = True
@@ -336,9 +337,10 @@ class Connection:
             await self.aclose()
             if cmd:
                 await cmd.set_result(e, dont_retry=True)
-            # TODO this can't be called twice, because we do it in the end, if an exception happened it's surely before ?
-            if self._release_cb:
-                self._release_cb(self)
+                # TODO this can't be called twice, because we do it in the end, if an exception happened it's surely before ?
+                # If no cmd in queue, this means that the release will have no effect.
+                if self._release_cb:
+                    self._release_cb(self)
             # TODO (async) is there any point in throwing this exception here ?
             #raise
 
@@ -551,7 +553,7 @@ class Command:
 
 
 class Multiplexer:
-    __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots'
+    __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots', '_not_allowed_commands'
 
     def __init__(self, configuration=None):
         self._endpoints, self._configuration = parse_uri(configuration)
@@ -566,6 +568,7 @@ class Multiplexer:
         self._command_cache = {}
         self._already_asking_for_slots = False
         self._slots = []
+        self._not_allowed_commands = not_allowed_commands_with_blocking
 
     async def __aenter__(self):
         return self
@@ -638,8 +641,8 @@ class Multiplexer:
 
     # TODO async locks are not re-entrant, validate all code path to this function is not recursive
     async def _get_connection(self, addr=None, is_slow=False):
-        if is_slow:
-            raise RedisError('Please use a connection pool for blocking or slow commands')
+#        if is_slow:
+#            raise RedisError('Please use a connection pool for blocking or slow commands')
         if addr:
             conn = self._connections.get(addr)
             if not conn or conn.closed:
