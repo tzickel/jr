@@ -12,6 +12,7 @@ import hiredis
 
 # Things to check for:
 # asyncio locks are not reentrant so do not create code path which can double lock an lock.
+# Remember shielding and cancelation and make sure it's not ignored (like with a catch all Exception)
 
 
 # Exceptions
@@ -40,7 +41,7 @@ elif sys.platform.startswith('win'):
     platform = 'windows'
 
 
-# TODO populate this list dynamically from command info ?
+# TODO would be nice if redis-server could provide us with list of blocking commands so we don't need to manage this manually here....
 not_allowed_commands_with_blocking = set((b'WATCH', b'BLPOP', b'MULTI', b'EXEC', b'DISCARD', b'BRPOP', b'AUTH', b'SELECT', b'SUBSCRIBE', b'PSUBSCRIBE', b'UNSUBSCRIBE', b'PUNSUBSCRIBE'))
 
 
@@ -230,10 +231,10 @@ class Connection:
         connecttimeout = config.get('connecttimeout', socket.getdefaulttimeout())
         connectretry = config.get('connectretry', 0) + 1
         sockettimeout = config.get('sockettimeout', socket.getdefaulttimeout())
-        # TODO (async) 64Kb ?
+        # TODO (perf) what is the optimal size here ?
         buffersize = config.get('recvbuffersize', 65536)
         tcpkeepalive = config.get('tcpkeepalive', None)
-        # TODO (async) True ?
+        # TODO (perf) is it better to enable or disable tcp nodelay by default?
         tcpnodelay = config.get('tcpnodelay', True)
         while connectretry:
             try:
@@ -244,7 +245,7 @@ class Connection:
                 elif isinstance(endpoint, tuple):
                     self.reader, self.writer = await async_with_timeout(open_connection(host=endpoint[0], port=endpoint[1], limit=buffersize), connecttimeout)
                     self.buffersize = buffersize
-                    # TODO (async) setup timeout
+                    # TODO (async) setup send / recv timeout
                     self.timeout = sockettimeout
                 else:
                     raise RedisError('Invalid endpoint')
@@ -260,7 +261,7 @@ class Connection:
             self.name = self.name[:2]
         # TCP connection settings
         if isinstance(sock.getsockname(), tuple):
-            # TODO should we mess around with send/recv buffer sizes ?
+            # TODO (perf) should we mess around with send/recv buffer sizes ?
             if tcpnodelay:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             else:
@@ -303,7 +304,7 @@ class Connection:
                 cmd = None
                 result = await self.recv()
                 if self._pubsub_cb:
-                    # TODO can this fail, should we catch exceptions and ignore here ?
+                    # We expect self._pubsub_cb not to fail
                     self._pubsub_cb(result)
                     continue
                 cmd = self.commands.popleft()
@@ -317,39 +318,38 @@ class Connection:
                     result = [result]
                 # Since this can block the recv loop, inside it actually calls ensure_future to not block this loop
                 await cmd.set_result(result)
+                # We call this in the end to prevent a race condition, and make sure no exception can be thrown between releasing and someone sending a new command and we closing the connection.
                 if self._release_cb:
                     self._release_cb(self)
-                # TODO should we call this here ?
+                # TODO (async) should we call this here ?
                 #await self.writer.drain()
                 result = None
         except Exception as e:
             if self._pubsub_cb:
-                try:
-                    self._pubsub_cb(e)
-                except Exception:
-                    pass
+                self._pubsub_cb(e)
+                # We clear this here because we don't want self.aclose() to call it again.
                 self._pubsub_cb = None
+            if not cmd:
+                # We clear this here because since no comamnd is queued, nobody took the connection, and calling .release will be a counting bug.
+                self._release_cb = None
             await self.aclose()
             if cmd:
                 await cmd.set_result(e, dont_retry=True)
-                # TODO this can't be called twice, because we do it in the end, if an exception happened it's surely before ?
-                # If no cmd in queue, this means that the release will have no effect.
-                if self._release_cb:
-                    self._release_cb(self)
             # TODO (async) is there any point in throwing this exception here ?
             #raise
 
-    # Don't accept any new commands, but the read stream might still be alive
+    # Don't accept any new commands, but the read stream might still be alive handling previous answers
     async def aclose_write(self):
+        # We call this before write_eof so no other piece of code will write to this connection
+        self.closed = True
         try:
             self.writer.write_eof()
             # TODO (async) is there a better way to flush the buffers ?
             await self.writer.drain()
         except Exception:
             pass
-        self.closed = True
 
-    # TODO since this can be called from outside code when aclose_write sets up self.closed = True, we need to make sure to wait until the recv side is over to not lose in-transit responses!
+    # TODO (correctness) since this can be called from outside code when aclose_write sets up self.closed = True, we need to make sure to wait until the recv side is over to not lose in-transit responses!
     async def aclose(self):
         self.closed = True
         if not self.cleanedup:
@@ -360,6 +360,7 @@ class Connection:
             except Exception:
                 pass
             #try:
+                # TODO (correctness) We don't do nothing here, because we closed the writer side, and the redis server should handle closing the other side..., maybe wait for it to happen, or add a force close option ?
                 # TODO figure out if we really need to await here, and it's implications
                 # TODO (async) make sure this cancel won't cause a propegating erorr for an cmd in flight !!
                 # TODO maybe I don't need this, the closing above should throw an exception
@@ -376,16 +377,17 @@ class Connection:
                     await command.set_result(RedisError('Connection closed'), dont_retry=True)
                 self.commands = []
             if self._pubsub_cb:
-                try:
-                    # In case someone closed this connection not from an I/O error
-                    self._pubsub_cb(RedisError('Connection closed'))
-                except Exception:
-                    pass
-            self._pubsub_cb = None
+                # In case someone closed this connection not from an I/O error
+                self._pubsub_cb(RedisError('Connection closed'))
+                self._pubsub_cb = None
+            if self._release_cb:
+                self._release_cb(self)
+                self._release_cb = None
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
     # TODO (async) this is wrong, TCP NODELAY is auto set... check performance...
     async def send(self, cmd):
+        # TODO (correctness) hmm... how can we get to self.closed being True here ? we should retry on another connection no ?
         if self.closed:
             raise RedisError('Connection already closed')
         cmd.ready_to_await()
@@ -412,9 +414,11 @@ class Connection:
                 self.commands.append(cmd)
             for x in cmd.stream(self.chunk_send_size):
                 self.writer.write(x)
-            # TODO should we call drain here ?
+            # TODO (async) should we call drain here ?
             #await self.writer.drain()
         except Exception as e:
+            # The reason we manually set closed here is that we want to prevent any other attemps to write to this socket ASAP before yielding
+            self.closed = True
             await self.aclose_write()
             await cmd.set_result(e)
 
@@ -462,8 +466,8 @@ class Command:
     def get_number(self):
         return self._database._number if self._database else None
     
-    # TODO use this all over the code
-    # TODO replace the _data with the already encoded data ?
+    # TODO (correctness) use this all over the code
+    # TODO (performence) replace the _data with the already encoded data ?
     def get_index_as_bytes(self, index):
         return self._encoder(self._data[index])
 
@@ -518,14 +522,14 @@ class Command:
                         self._server = addr
                         ensure_future(self._database._multiplexer._send_command(self))
                         return
-            # TODO should we call decoder on Exceptions as well ?
+            # TODO (misc) should we call decoder on Exceptions as well ?
             self._result = result if not self._decoder else self._decoder(result)
             self._got_result = True
             self._event.set()
             self._data = None
             self._database = None
             self._event = None
-        # TODO some stuff can be in finally here...
+        # TODO (misc) some stuff can be in finally here...
         except Exception as e:
             # This protection is added in case we get an exception but a inner-recursion of _send_command already handled it
             if not self._got_result:
