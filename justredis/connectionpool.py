@@ -100,6 +100,7 @@ class MultiplexerPool(Multiplexer):
                             self._last_connection = pool = self._connections[addr] = ConnectionPool(addr, self._configuration, self._maxconnections)
                             # TODO reset each time? (i.e. if we move from a clustered server to a non clustered one)
                             if self._clustered is None:
+                                # TODO dont pass is_slow here...
                                 await self._update_slots(with_connection=await pool.take(is_slow))
                         return await pool.take(is_slow)
                     except Exception as e:

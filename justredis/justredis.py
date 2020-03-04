@@ -820,73 +820,87 @@ class Database:
     def multi(self, retries=None):
         return MultiCommand(self, retries if retries is not None else self._retries, server=self._server)
 
-    async def watch(self, *keys):
-        return await MultiWatchCommand.create(self, keys)
+    def watch(self, *keys):
+        return MultiWatchCommand(self, keys)
 
 
-# TODO haevay cleanup code (because we take a key, we need to unwatch and discard!)
+# TODO heavy cleanup code (because we take a key, we need to unwatch and discard!)
+# TODO add __slots__
 class MultiWatchCommand:
-    #__slots__ = '_database', '_server', '_cmds', '_done', '_asking'
-
-    @classmethod
-    async def create(cls, database, *keys):
-        ret = cls()
-        await ret._init(database, keys)
-        return ret
-
-    async def _init(self, database, keys):
+    def __init__(self, database, initial_keys):
         self._database = database
-        if not keys:
+        if not initial_keys:
             raise RedisError('No keys set to watch')
-        key = self._database._encoder(keys[0])
-        self._conn = await self._database._multiplexer._get_connection_for_hashslot(calc_hash(key), is_slow=True)
+        self._initial_keys = initial_keys
+        self._state = 0
+        self._conn = None
+
+    # We do this just to not have an awkward API on Databse.watch (async with await watch....) 
+    async def _init(self):
+        if self._state == 1:
+            return
+        elif self._state > 1:
+            raise RedisError('Please do not call a function after enter multi phase')
+        encoder = self._database._encoder or utf8_encode
+        if self._database._multiplexer._clustered:
+            key = encoder(self._initial_keys[0])
+            self._conn = await self._database._multiplexer._get_connection_for_hashslot(calc_hash(key), is_slow=True)
+        else:
+            self._conn = await self._database._multiplexer._get_connection(is_slow=True)
         # Disabling callback for releasing the connection
         self._tmp_release_func = self._conn.set_release_cb(None)
-        self._conn
         try:
-            keys = [self._database._encoder(x) for x in keys]
+            keys = [encoder(x) for x in self._initial_keys]
             watch_cmd = Command((b'WATCH', ) + tuple(keys), retries=0, throw=True)
             await self._conn.send(watch_cmd)
         except:
             # TODO reset it's state....
             # TODO release self._conn
             raise
-        self._state = 0
+        self._state = 1
 
-    async def acommand(self, *args, **kwargs):
-        pass
+    async def command(self, *args, **kwargs):
+        await self._init()
+        return await self._database.command(*args, **kwargs)
 
-    async def acommandreply(self):
-        pass
+    async def commandreply(self, *args, **kwargs):
+        await self._init()
+        return await self._database.commandreply(*args, **kwargs)
 
-    def multi():
-        pass
-
-    async def aclose(self):
-        pass
+    def multi(self):
+        if self._state == 0:
+            raise RedisError('Please run some commands between watch and multi phase')
+        elif self._state != 1:
+            raise RedisError('Already entered a multi phase')
+        self._state = 2
+        # TODO make use a perisstnet connection
+        return MultiCommand(self._database, None, None, self._conn)
 
     async def __aenter__(self):
-        pass
+        return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
-        pass
+        await self.aclose()
 
-    async def discard(self, soft=False):
-        pass
-
-    async def execute(self, soft=False):
-        pass
+    async def aclose(self):
+        if self._conn:
+            self._tmp_release_func(self._conn)
+            self._tmp_release_func = None
+            self._conn = None
+            self._database = None
+            # TODO clear all
 
 
 # TODO (misc) split the user facing API from the internal Command one (atleast mark it as _)
 # To know the result of a multi command simply resolve any command inside
 class MultiCommand:
-    __slots__ = '_database', '_retries', '_server', '_cmds', '_done', '_asking'
+    __slots__ = '_database', '_retries', '_server', '_with_persistent_conn', '_cmds', '_done', '_asking'
 
-    def __init__(self, database, retries, server):
+    def __init__(self, database, retries, server, with_persistent_conn=None):
         self._database = database
         self._retries = retries
         self._server = server
+        self._with_persistent_conn = with_persistent_conn
         self._cmds = []
         self._done = False
         self._asking = False
@@ -967,7 +981,10 @@ class MultiCommand:
             e_cmd = Command((b'EXEC', ), self._database)
             self._cmds.insert(0, m_cmd)
             self._cmds.append(e_cmd)
-            await self._database._multiplexer._send_command(self)
+            if self._with_persistent_conn:
+                await self._with_persistent_conn.send(self)
+            else:
+                await self._database._multiplexer._send_command(self)
 
     # TODO (async) for parity, should this be await as well ?
     def command(self, *args, **kwargs):
