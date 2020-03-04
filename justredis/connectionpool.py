@@ -5,8 +5,8 @@ from . import Multiplexer, RedisError
 from .justredis import Connection
 
 
-# TODO add minconnections ? remove old expired connections ?
-# TODO is the self._limit semaphore being counted correctly ?
+# TODO (functionality) add minconnections ? remove old expired connections ?
+# TODO (correctness) is the self._limit semaphore being counted correctly ?
 class ConnectionPool:
     def __init__(self, addr, configuration, maxconnections):
         self._addr = addr
@@ -81,7 +81,7 @@ class MultiplexerPool(Multiplexer):
         self._maxconnections = configuration.get('maxconnections', 10)
         self._not_allowed_commands = not_allowed_commands
 
-    # TODO this should be refactored into the main Multiplexer._get_connection
+    # TODO (readability) this should be refactored into the main Multiplexer._get_connection
     async def _get_connection(self, addr=None, is_slow=False):
         if addr:
             return await self._connections.setdefault(addr, ConnectionPool(addr, self._configuration, self._maxconnections)).take(is_slow)
@@ -100,8 +100,7 @@ class MultiplexerPool(Multiplexer):
                             self._last_connection = pool = self._connections[addr] = ConnectionPool(addr, self._configuration, self._maxconnections)
                             # TODO reset each time? (i.e. if we move from a clustered server to a non clustered one)
                             if self._clustered is None:
-                                # TODO dont pass is_slow here...
-                                await self._update_slots(with_connection=await pool.take(is_slow))
+                                await self._update_slots(with_connection=await pool.take(False))
                         return await pool.take(is_slow)
                     except Exception as e:
                         exp = e
@@ -110,4 +109,5 @@ class MultiplexerPool(Multiplexer):
                         self._connections.pop(addr, None)
                 self._last_connection = None
                 raise exp
+            # TODO if it's full, we can actually take a connection from another server
             return await self._last_connection.take(is_slow)

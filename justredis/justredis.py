@@ -380,9 +380,10 @@ class Connection:
                 # In case someone closed this connection not from an I/O error
                 self._pubsub_cb(RedisError('Connection closed'))
                 self._pubsub_cb = None
-            if self._release_cb:
-                self._release_cb(self)
-                self._release_cb = None
+            # TODO (correctness) in Python 3.6 this is called without aborting the recv loop and leaks, is this ok to comment, since anyhow only the multiplexer should have access to this and call this ?
+            #if self._release_cb:
+                #self._release_cb(self)
+                #self._release_cb = None
 
     # TODO We dont set TCP NODELAY to give it a chance to coalese multiple sends together, another option might be to queue them together here
     # TODO (async) this is wrong, TCP NODELAY is auto set... check performance...
