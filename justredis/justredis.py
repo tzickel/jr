@@ -436,10 +436,14 @@ class Connection:
             raise
 
     def set_pubsub_cb(self, cb):
+        old_cb = self._pubsub_cb
         self._pubsub_cb = cb
+        return old_cb
     
     def set_release_cb(self, cb):
+        old_cb = self._release_cb
         self._release_cb = cb
+        return old_cb
 
 
 class Command:
@@ -616,7 +620,7 @@ class Multiplexer:
         return res
 
     # TODO maybe make an internal loop instead of _retry ?
-    async def _get_connection_for_hashslot(self, hashslot, _retry=True, is_slow=False):
+    async def _get_connection_for_hashslot(self, hashslot, is_slow=False, _retry=True):
         if not hashslot:
             raise RedisError('Do not call _get_connection_for_hashslot without an hashslot')
         if not self._slots:
@@ -634,7 +638,7 @@ class Multiplexer:
         except Exception:
             if _retry:
                 # We are retrying here once in case of an exception, because maybe the world view has changed
-                return await self._get_connection_for_hashslot(hashslot, False, is_slow)
+                return await self._get_connection_for_hashslot(hashslot, is_slow, False)
             else:
                 raise
 
@@ -816,8 +820,65 @@ class Database:
     def multi(self, retries=None):
         return MultiCommand(self, retries if retries is not None else self._retries, server=self._server)
 
+    async def watch(self, *keys):
+        return await MultiWatchCommand.create(self, keys)
 
-# TODO maybe split the user facing API from the internal Command one (atleast mark it as _)
+
+# TODO haevay cleanup code (because we take a key, we need to unwatch and discard!)
+class MultiWatchCommand:
+    #__slots__ = '_database', '_server', '_cmds', '_done', '_asking'
+
+    @classmethod
+    async def create(cls, database, *keys):
+        ret = cls()
+        await ret._init(database, keys)
+        return ret
+
+    async def _init(self, database, keys):
+        self._database = database
+        if not keys:
+            raise RedisError('No keys set to watch')
+        key = self._database._encoder(keys[0])
+        self._conn = await self._database._multiplexer._get_connection_for_hashslot(calc_hash(key), is_slow=True)
+        # Disabling callback for releasing the connection
+        self._tmp_release_func = self._conn.set_release_cb(None)
+        self._conn
+        try:
+            keys = [self._database._encoder(x) for x in keys]
+            watch_cmd = Command((b'WATCH', ) + tuple(keys), retries=0, throw=True)
+            await self._conn.send(watch_cmd)
+        except:
+            # TODO reset it's state....
+            # TODO release self._conn
+            raise
+        self._state = 0
+
+    async def acommand(self, *args, **kwargs):
+        pass
+
+    async def acommandreply(self):
+        pass
+
+    def multi():
+        pass
+
+    async def aclose(self):
+        pass
+
+    async def __aenter__(self):
+        pass
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        pass
+
+    async def discard(self, soft=False):
+        pass
+
+    async def execute(self, soft=False):
+        pass
+
+
+# TODO (misc) split the user facing API from the internal Command one (atleast mark it as _)
 # To know the result of a multi command simply resolve any command inside
 class MultiCommand:
     __slots__ = '_database', '_retries', '_server', '_cmds', '_done', '_asking'
