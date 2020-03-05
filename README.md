@@ -1,39 +1,33 @@
 ## What?
 An asynchronous redis client library for Python 3.6+
 
-Please note that this project is currently alpha quality and the API is not finalized. Please provide feedback if you think the API is convenient enough or not.
+Please note that this project is currently alpha quality and the API is not finalized. Please provide feedback if you think the API is convenient enough or not. A permissive license will be chosen once the API will be more mature for wide spread consumption.
 
 ## Why?
 ### All commands are pipelined by default
 
 Since most Redis server commands are intended to be run for a short time on the server, sometimes you pay more time on network latency than execution time. By splitting the sending and receiving parts into seperate coroutines all commands are sent seperately from waiting for their response.
 
-### Transparent connection pooling and connection multiplexing
+### Transparent API
 
-You have an option to use a Multiplexer which can multiplex multiple coroutinues that want to communicate with a Redis server together in one single socket per server.
+The library focuses on hiding from you the internals of Redis behaviour such as pipelining, cluster support, script caching, slow and blocking and multi commands, connection pooling, publish and subscribe.
 
-Or use a MultiplexerPool which can also support slow and blocking commands (transparently).
+You can see the example below for some examples.
 
-### Transparent Redis Cluster support
+### Missing
 
-The library handles behind the scenes all the cluster managment. You use the regular non-cluster API and it figures it all out. There are special commands such as running a command on all masters, etc...
+The library currently does not focus on providing the following:
 
-Currently the library talks to the current masters of the cluster.
-
-### Other features including
-
-1. Sane Publish / Subcscribe API
-2. Transparent script caching
-3. Optional per connection or per command encoding / decoding / pipelining
-4. Automated testing for both single and cluster
-5. Hiredis parser (required)
+1. A higher level API for understanding the different commands responses
+2. Sentinal support
+3. Implementing high-level constructs such as distributed locks on top of redis
+4. SSL connections
 
 ## Roadmap
-- [ ] Choose license
 - [ ] API Finalization
-- [ ] Remove all TODO incode
+- [ ] Choose license
+- [ ] Remove all TODO in code
 - [ ] More test coverage and test out network I/O failure and concurrency
-
 
 ## Installing
 For now you can install this via this github repository by pip installing or adding to your requirements.txt file:
@@ -53,25 +47,42 @@ import asyncio
 async def main():
     # Connect to the default redis port on localhost
     async with MultiplexerPool() as redis:
-        # Send commands to database #0 (and decode the results as utf-8 strings instead of bytes)
+        # Send commands to database #0 (and use by default bytes as utf8 strings decoder)
         db = redis.database(decoder=utf8_bytes_as_strings)
         # Shortcut so you don't have to type long words each time
         c = db.command
         cr = db.commandreply
-        # Send an pipelined SET request where you don't care about the result (You don't have to use bytes notation or caps for the command name)
+        # Send an pipelined SET request where you don't care about the result (You don't have to use bytes notation or caps)
         await c(b'SET', 'Hello', 'World!')
         # Send a pipelined GET request and resolve it immediately
         print('Hello, %s' % await cr(b'GET', 'Hello'))
+
         # You can even send both commands together atomically (so if the first fails the second won't run)
         async with db.multi() as m:
             m.command(b'SET', 'Hello', 'World!')
             hello = m.command(b'GET', 'Hello')
         print('Atomic Hello, %s' % await hello())
 
-        # This shows support in the Pooled multiplexer for blocking commands.
+        # This shows support in the Pooled multiplexer for blocking commands
         waiting = await c(b'BLPOP', 'queue', 0)
         await cr(b'RPUSH', 'queue', 'Hello, World!')
         print('Queued %s' % (await waiting())[1])
+
+        # And even with publish & subscribe.
+        async with redis.pubsub(decoder=utf8_bytes_as_strings) as pubsub:
+            await pubsub.add('Hello')
+            await cr(b'PUBLISH', 'Hello', 'World!')
+            await pubsub.message() # This is the registration message for the Hello channel.
+            print('PubSub Hello, %s' % (await pubsub.message())[2])
+
+        # And here we can do an atomic get and increment example
+        async with db.watch('Counter') as w:
+            value = int(await w.commandreply(b'GET', 'Counter') or 0)
+            value += 1
+            async with w.multi() as m:
+                m.command(b'SET', 'Counter', value)
+            # If there is an transaction error, it will throw here
+            counter = value
 
 
 if __name__ == '__main__':
@@ -80,7 +91,7 @@ if __name__ == '__main__':
     loop.close()
 ```
 
-You can check the [tests](tests/test.py) for some more examples such as pub/sub usage.
+You can check the [tests](tests/test.py) for some more examples.
 
 ## API
 This is all the API in a nutshell:
