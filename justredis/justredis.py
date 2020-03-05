@@ -555,6 +555,10 @@ class Command:
             raise self._result
         return self._result
 
+    # To make it look like a future
+    def __await__(self):
+        return self.__call__().__await__()
+
 
 class Multiplexer:
     __slots__ = '_endpoints', '_configuration', '_connections', '_last_connection', '_scripts', '_scripts_sha', '_pubsub', '_lock', '_clustered', '_command_cache', '_already_asking_for_slots', '_slots', '_not_allowed_commands'
@@ -809,6 +813,12 @@ class Database:
         self._server = server
         self._scripts = multiplexer._scripts
         self._scripts_sha = multiplexer._scripts_sha
+
+    async def __aenter__(self):
+        return self.command, self.commandreply, self.multi, self.watch
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        pass
 
     async def command(self, *args, **kwargs):
         cmd = parse_command(self, *args, **kwargs)
@@ -1069,27 +1079,28 @@ class PubSub:
         await self.create_connection()
 
     async def _command(self, cmd, *args):
+        # TODO (question) maybe we should soft fail here on I/O error, so that only async message() will be the error point
+        if await self.create_connection():
+            channels = self._registered_channels.keys()
+            if channels:
+                cmd = Command((b'SUBSCRIBE', ) + tuple(channels), enqueue=False, retries=0, throw=False)
+                await self._connection.send(cmd)
+            patterns = self._registered_patterns.keys()
+            if patterns:
+                cmd = Command((b'PSUBSCRIBE', ) + tuple(patterns), enqueue=False, retries=0, throw=False)
+                await self._connection.send(cmd)
+            ret = True
+        # If it's a new connection, it will already run the command in the given list above
+        else:
+            cmd = Command((cmd, ) + args, enqueue=False, retries=0, throw=False)
+            await self._connection.send(cmd)
+            ret = False
+
         if not self._registered_channels and not self._registered_patterns:
             await self._connection.aclose()
             return True
-        else:
-            # TODO (question) maybe we should soft fail here on I/O error, so that only async message() will be the error point
-            if await self.create_connection():
-                channels = self._registered_channels.keys()
-                if channels:
-                    cmd = Command((b'SUBSCRIBE', ) + tuple(channels), enqueue=False, retries=0, throw=False)
-                    await self._connection.send(cmd)
-                patterns = self._registered_patterns.keys()
-                if patterns:
-                    cmd = Command((b'PSUBSCRIBE', ) + tuple(patterns), enqueue=False, retries=0, throw=False)
-                    await self._connection.send(cmd)
-                ret = True
-            # If it's a new connection, it will already run the command in the given list above
-            else:
-                cmd = Command((cmd, ) + args, enqueue=False, retries=0, throw=False)
-                await self._connection.send(cmd)
-                ret = False
-            return ret
+
+        return ret
 
     # TODO (question) should we deliver ping to everyone, or the instance who requested only ?
     async def ping(self, message=None):
@@ -1119,6 +1130,8 @@ class PubSub:
     async def unregister(self, instance, channels=None, patterns=None):
         channels_to_remove = []
         patterns_to_remove = []
+        local_channels_to_remove = set()
+        local_patterns_to_remove = set()
         registered_channels, registered_patterns = self._registered_instances[instance]
         for channel in registered_channels:
             if channels and channel not in channels:
@@ -1127,8 +1140,10 @@ class PubSub:
             if registered_channel is None:
                 continue
             registered_channel.discard(instance)
+            local_channels_to_remove.add(channel)
             if not registered_channel:
                 channels_to_remove.append(channel)
+                del self._registered_channels[channel]
         for pattern in registered_patterns:
             if patterns and pattern not in patterns:
                 continue
@@ -1136,8 +1151,12 @@ class PubSub:
             if registered_pattern is None:
                 continue
             registered_pattern.discard(instance)
+            local_patterns_to_remove.add(pattern)
             if not registered_pattern:
                 patterns_to_remove.append(pattern)
+                del self._registered_patterns[pattern]
+        registered_channels -= local_channels_to_remove
+        registered_patterns -= local_patterns_to_remove
         if not registered_channels and not registered_patterns:
             del self._registered_instances[instance]
         if channels_to_remove:
@@ -1185,6 +1204,7 @@ class PubSubInstance:
         await self._cmd(self._pubsub.register, channels, patterns)
 
     # TODO (question) should we removed the self._messages that are not related to this channels and patterns (left overs)?
+    # TODO don't call with both channels and patterns off, should we support removal of all ?
     async def remove(self, channels=None, patterns=None):
         await self._cmd(self._pubsub.unregister, channels, patterns)
 

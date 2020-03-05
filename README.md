@@ -20,13 +20,13 @@ The library currently does not focus on providing the following:
 
 1. A higher level API for understanding the different commands responses
 2. Sentinal support
-3. Implementing high-level constructs such as distributed locks on top of redis
-4. SSL connections
+3. SSL connections
+4. Implementing high-level constructs such as distributed locks on top of redis (Not in the scope of this project)
 
 ## Roadmap
 - [ ] API Finalization
 - [ ] Choose license
-- [ ] Remove all TODO in code
+- [ ] Resolve all TODO in code
 - [ ] More test coverage and test out network I/O failure and concurrency
 
 ## Installing
@@ -103,7 +103,7 @@ MultiplexerPool(configuration=None) or Multiplexer(configuration=None)
   async aclose()
   database(number=0, encoder=utf8_encode, decoder=None)
     async command(*args, encoder=utf8_encode, decoder=None, throw=True)
-      async __call__()
+      async __call__() # You can also await directly on the command as well
     async commandreply(*args, encoder=utf8_encode, decoder=None, throw=True)
     multi()
       async __aenter__()
@@ -111,10 +111,10 @@ MultiplexerPool(configuration=None) or Multiplexer(configuration=None)
       # Notice that this command is not awaitable
       command(*args, encoder=utf8_encode, decoder=None, throw=True)
         # But the result is
-        async __call__()
+        async __call__() # You can also await directly on the command as well
       # This command will be automatically called when leaving the context manager
       async execute()
-      # This command will be automatically called when leaving the context manager on exception (or can be called explicitly to abort)
+      # This command will be automatically called when leaving the context manager on exception (or can be called explicitly before to abort)
       async discard()
   pubsub(encoder=utf8_encode, decoder=None)
     async add(channels=None, patterns=None)
@@ -147,5 +147,41 @@ Multiplexer configuration is a list of endpoints or a dictionary that can contai
 * tcpnodelay - Enable (Default) / Disable TCP no delay
 * connectionhandler - Use a custom Connection class handler
 
+MultiplexerPool also has this parameters:
+
+* maxconnections - maximum number of in use connections before blocking new requests.
+
+
+## Redis command replacements
+Some redis commands are not allowed to be run directly, this chapter explains which commands, why, and what is their replacment.
+
+### Database selection (SELECT)
+
+Since the client can multiplex multiple commands into one socket, it's important to keep track on which database number each command is running.
+
+Each multiplexer has a `database(number=0, encoder=utf8_encode, decoder=None)` command which keeps track on which database number the commands are running.
+
+All the redis commands should be called via the Database object returned by database.
+
+### Transction (MULTI / EXEC / DISCARD)
+
+Since the client can multiplex multiple commands into one socket, and a transaction is a group of commands which is executed together atomically, it's important not to mix them up with other commands.
+
+Each database has an `multi()` command which you can run commands you want as part of a transaction together.
+
+It's important to see that the commands API is not awaitable inside a transaction scope, since they actually run in the end (execute part). You await for their result outside the transaction scope.
+
+### Conditional transaction (WATCH)
+
+### Password (AUTH)
+
+### Subscribe (SUBSCRIBE/ PSUBSCRIBE / UNSUBSCRIBE / PUNSUBSCRIBE)
+
+### Debugging (MONITOR)
+
+### Additional commands
+
+#### Cluster API
+
 ## Partially inspired by
-The .NET Redis client package [ServiceStack.Redis](https://stackexchange.github.io/StackExchange.Redis/)
+The .NET Redis client package [StackExchange.Redis](https://stackexchange.github.io/StackExchange.Redis/)
