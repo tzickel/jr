@@ -151,7 +151,6 @@ MultiplexerPool also has this parameters:
 
 * maxconnections - maximum number of in use connections before blocking new requests.
 
-
 ## Redis command replacements
 Some redis commands are not allowed to be run directly, this chapter explains which commands, why, and what is their replacment.
 
@@ -179,9 +178,9 @@ It's important to see that the commands API is not awaitable inside a transactio
 
 ### Debugging (MONITOR)
 
-### Additional commands
+## Additional commands
 
-#### Cluster API
+### Cluster API
 
 ## Partially inspired by
 The .NET Redis client package [StackExchange.Redis](https://stackexchange.github.io/StackExchange.Redis/)

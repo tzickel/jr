@@ -1203,9 +1203,11 @@ class PubSubInstance:
     async def add(self, channels=None, patterns=None):
         await self._cmd(self._pubsub.register, channels, patterns)
 
-    # TODO (question) should we removed the self._messages that are not related to this channels and patterns (left overs)?
-    # TODO don't call with both channels and patterns off, should we support removal of all ?
+    # TODO (question) should we removed the self._messages that are not related to this channels and patterns (left overs) ?
     async def remove(self, channels=None, patterns=None):
+        if channels is None and patterns is None:
+            # This is done not to trigger disconnection (an alternative is to pass an extra param to unregister in aclose)
+            return
         await self._cmd(self._pubsub.unregister, channels, patterns)
 
     async def message(self, timeout=None):
