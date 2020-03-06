@@ -981,9 +981,8 @@ class MultiCommand:
         return cmd
 
 
-# TODO the multiplexer .close should close this as well ?
-# TODO document the error model possible here and implications
-# TODO auto close by looking at the reply number of subs ? (nop)
+# TODO (corectness) the multiplexer .close should close this as well.
+# We could have closed the connection by looking at the reply number of current subs, but we keep internal bookkeeping for this.
 class PubSub:
     __slots__ = '_multiplexer', '_connection', '_registered_instances', '_registered_channels', '_registered_patterns'
 
@@ -1077,7 +1076,7 @@ class PubSub:
 
         return ret
 
-    # TODO (question) should we deliver ping to everyone, or the instance who requested only ?
+    # TODO (api) should we deliver ping to everyone, or the instance who requested only ?
     async def ping(self, message=None):
         if message:
             await self._command(b'PING', message)
@@ -1176,15 +1175,18 @@ class PubSubInstance:
             self._event = None
 
     async def add(self, channels=None, patterns=None):
+        if not channels and not patterns:
+            return
         await self._cmd(self._pubsub.register, channels, patterns)
 
-    # TODO (question) should we removed the self._messages that are not related to this channels and patterns (left overs) ?
+    # TODO (correctness) should we removed the self._messages that are not related to this channels and patterns (left overs) ?
     async def remove(self, channels=None, patterns=None):
-        if channels is None and patterns is None:
+        if not channels and not patterns:
             # This is done not to trigger disconnection (an alternative is to pass an extra param to unregister in aclose)
             return
         await self._cmd(self._pubsub.unregister, channels, patterns)
 
+    # TODO (performence) flow control limits here ?
     async def message(self, timeout=None):
         if self._closed:
             raise RedisError('Pub/sub instance closed')
@@ -1194,6 +1196,7 @@ class PubSubInstance:
         self._event.clear()
         # We check connection here to notify the end user if there is an connection error...
         await self._pubsub.check_connection(self)
+        # TODO (api) should we throw exception on timeout or return None ?
         if timeout is None:
             await self._event.wait()
         else:
@@ -1227,10 +1230,9 @@ class PubSubInstance:
             self._event.set()
 
     def _get_message(self):
-        try:
-            msg = self._messages.popleft()
-        except IndexError:
+        if not self._messages:
             return None
+        msg = self._messages.popleft()
         if self._decoder:
             msg = self._decoder(msg)
         if isinstance(msg, Exception):

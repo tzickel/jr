@@ -7,6 +7,7 @@ from .justredis import Connection
 
 # TODO (functionality) add minconnections ? remove old expired connections ?
 # TODO (correctness) is the self._limit semaphore being counted correctly ?
+# TODO (optional) no maxconnections ?
 class ConnectionPool:
     def __init__(self, addr, configuration, maxconnections):
         self._addr = addr

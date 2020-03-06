@@ -116,6 +116,13 @@ MultiplexerPool(configuration=None) or Multiplexer(configuration=None)
       async execute()
       # This command will be automatically called when leaving the context manager on exception (or can be called explicitly before to abort)
       async discard()
+    watch(*keys)
+      async __aenter__()
+      async __aexit__()
+      async aclose()
+      async command() # Like above
+      async commandreply() # like above
+      multi() # Like above
   pubsub(encoder=utf8_encode, decoder=None)
     async add(channels=None, patterns=None)
     async remove(channels=None, patterns=None)
@@ -214,12 +221,18 @@ If you want to subscribe to topics (channels and patterns), use the multiplexer 
 
 You can then call `message(timeout)` to wait for a message on one of the registered topics.
 
+If there is an I/O error while waiting for a message, an Exception will be thrown. Attempting to call `message` again, will attempt to reconnect and reestablish the listened topics.
+
 ```python
 async with redis.pubsub(decoder=utf8_bytes_as_strings) as pubsub:
     await pubsub.add('Some Channel')
     while True:
         msg = await pubsub.message()
 ```
+
+### Scripting (EVAL)
+
+EVAL commands, are first tried to be run as EVALSHA commands (i.e. only their hash is sent to the server), if the attempt fails (the server does not know this script), the client auto sends the request as an EVAL again.
 
 ### Debugging (MONITOR)
 

@@ -13,7 +13,7 @@ except ImportError:
 
 
 class RedisProtocol(BaseProtocol):
-    __slots__ = '_buffer', '_transport', '_reader', '_messages', '_wait', '_eof', '_closed', '_write_drained'
+    __slots__ = '_buffer', '_buffer_size', '_transport', '_reader', '_messages', '_wait', '_eof', '_closed', '_write_drained'
 
     @classmethod
     async def create_connection(cls, *args, **kwargs):
@@ -51,10 +51,9 @@ class RedisProtocol(BaseProtocol):
 
     def get_buffer(self, sizehint):
         if sizehint == -1:
-            # TODO get this from constructor
+            # TODO (performance) get this from constructor
             sizehint = 2**16
         if self._buffer is None or self._buffer_size != sizehint:
-            print('new')
             self._buffer = bytearray(sizehint)
             self._buffer_size = sizehint
         return self._buffer
