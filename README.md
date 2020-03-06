@@ -162,6 +162,11 @@ Each multiplexer has a `database(number=0, encoder=utf8_encode, decoder=None)` c
 
 All the redis commands should be called via the Database object returned by database.
 
+```python
+db = redis.database() # you can set database(2) for database #2
+a = await db.cr('get', 'a')
+```
+
 ### Transction (MULTI / EXEC / DISCARD)
 
 Since the client can multiplex multiple commands into one socket, and a transaction is a group of commands which is executed together atomically, it's important not to mix them up with other commands.
@@ -170,17 +175,61 @@ Each database has an `multi()` command which you can run commands you want as pa
 
 It's important to see that the commands API is not awaitable inside a transaction scope, since they actually run in the end (execute part). You await for their result outside the transaction scope.
 
+```python
+db = redis.database()
+async with db.multi() as m:
+    m.commmand('set', 'a', 'b')
+    a = m.command('get', 'a')
+a = await a
+```
+
 ### Conditional transaction (WATCH)
+
+Conditional transactions require to send each command between the WATCH and MULTI part directly and get the result, thus that part has additional interface above the regular transaction one above.
+
+The database has an `watch(*keys)` command which starts a conditional transaction.
+
+```python
+db = redis.database()
+async with db.watch('Counter') as w:
+    value = int(await w.commandreply(b'GET', 'Counter') or 0)
+    value += 1
+    async with w.multi() as m:
+        m.command(b'SET', 'Counter', value)
+    # If there is an transaction error, it will throw here
+    counter = value
+```
 
 ### Password (AUTH)
 
+Since the multiplexer handles reconnection, you should not manualy call the AUTH command to authenticate with the server.
+
+If your redis server has password authentication, then pass to the multiplexer constructor the password argument.
+
 ### Subscribe (SUBSCRIBE/ PSUBSCRIBE / UNSUBSCRIBE / PUNSUBSCRIBE)
 
+The multiplexer combines all the subscribed channels and patterns into one socket. It provides a high level API to manage it.
+
+If you want to subscribe to topics (channels and patterns), use the multiplexer `pubsub()` command, which returns an instance you can `add(channels, patterns)` or `remove(channels, patterns)`
+
+You can then call `message(timeout)` to wait for a message on one of the registered topics.
+
+```python
+async with redis.pubsub(decoder=utf8_bytes_as_strings) as pubsub:
+    await pubsub.add('Some Channel')
+    while True:
+        msg = await pubsub.message()
+```
+
 ### Debugging (MONITOR)
+
+Not implmented yet (can be done like Subscribe)
 
 ## Additional commands
 
 ### Cluster API
+
+The Multiplexer has the command `run_commandreply_on_all_masters()` which runs the given command on all the cluster masters and returns the result as a dictionary with each server has an entry.
 
 ## Partially inspired by
 The .NET Redis client package [StackExchange.Redis](https://stackexchange.github.io/StackExchange.Redis/)
