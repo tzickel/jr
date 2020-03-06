@@ -8,8 +8,8 @@ from binascii import crc_hqx
 from collections import deque
 from hashlib import sha1
 
-from .protocol import RedisProtocol
 from .exceptions import RedisError, RedisReplyError
+from .protocol import RedisProtocol
 
 # Things to check for:
 # asyncio locks are not reentrant so do not create code path which can double lock an lock.

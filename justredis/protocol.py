@@ -2,8 +2,8 @@ import asyncio
 from collections import deque
 
 import hiredis
-from .exceptions import RedisError, RedisReplyError
 
+from .exceptions import RedisError, RedisReplyError
 
 try:
     from asyncio import BufferedProtocol as BaseProtocol
@@ -27,6 +27,7 @@ class RedisProtocol(BaseProtocol):
 
     def __init__(self):
         self._buffer = None
+        self._buffer_size = -1
         self._transport = None
         self._reader = hiredis.Reader()
         self._messages = deque()
@@ -52,7 +53,10 @@ class RedisProtocol(BaseProtocol):
         if sizehint == -1:
             # TODO get this from constructor
             sizehint = 2**16
-        self._buffer = bytearray(sizehint)
+        if self._buffer is None or self._buffer_size != sizehint:
+            print('new')
+            self._buffer = bytearray(sizehint)
+            self._buffer_size = sizehint
         return self._buffer
 
     def buffer_updated(self, nbytes):

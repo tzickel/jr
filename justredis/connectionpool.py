@@ -1,4 +1,4 @@
-from asyncio import Semaphore, wait_for, Lock
+from asyncio import Lock, Semaphore, wait_for
 from collections import deque
 
 from . import Multiplexer, RedisError
