@@ -5,57 +5,6 @@ import hiredis
 from .exceptions import RedisError, RedisReplyError
 
 
-def chunk_encoded_command(cmd, chunk_size):
-    data = []
-    data_len = 0
-    for x in cmd.encode():
-        chunk_len = len(x)
-        if data_len > chunk_size or chunk_len > chunk_size:
-            yield b''.join(data)
-            if chunk_len > chunk_size:
-                yield x
-                data = []
-                data_len = 0
-            else:
-                data = [x]
-                data_len = chunk_len
-        else:
-            data.append(x)
-            data_len += chunk_len
-    if data:
-        yield b''.join(data)
-
-
-def chunk_encoded_commands(cmds, chunk_size):
-    data = []
-    data_len = 0
-    for cmd in cmds:
-        for x in cmd.encode():
-            chunk_len = len(x)
-            if data_len > chunk_size or chunk_len > chunk_size:
-                yield b''.join(data)
-                if chunk_len > chunk_size:
-                    yield x
-                    data = []
-                    data_len = 0
-                else:
-                    data = [x]
-                    data_len = chunk_len
-            else:
-                data.append(x)
-                data_len += chunk_len
-    if data:
-        yield b''.join(data)
-
-
-def encode_command(data, encoder):
-    output = [b'*%d\r\n' % len(data)]
-    for arg in data:
-        arg = encoder(arg)
-        output.extend((b'$%d\r\n' % len(arg), arg, b'\r\n'))
-    return output
-
-
 try:
     from asyncio import BufferedProtocol as BaseProtocol
 # Python 3.6 support
@@ -126,6 +75,8 @@ class RedisProtocol(BaseProtocol):
         if res is not False:
             self._wait.set()
         while res is not False:
+            if isinstance(res, hiredis.ReplyError):
+                res = RedisReplyError(*res.args)
             self._messages.append(res)
             res = self._reader.gets()
 
@@ -143,9 +94,6 @@ class RedisProtocol(BaseProtocol):
 
     def write(self, stream):
         self._transport.writelines(stream)
-
-    def write_raw(self, *cmd):
-        self._transport.writelines(encode_command(cmd, lambda x: x.encode()))
 
     def close(self):
         if not self._closed:
