@@ -8,21 +8,12 @@ from binascii import crc_hqx
 from collections import deque
 from hashlib import sha1
 
-import hiredis
+from .protocol import RedisProtocol
+from .exceptions import RedisError, RedisReplyError
 
 # Things to check for:
 # asyncio locks are not reentrant so do not create code path which can double lock an lock.
 # Remember shielding and cancelation and make sure it's not ignored (like with a catch all Exception)
-
-
-# Exceptions
-# An error response from the redis server
-class RedisReplyError(Exception):
-    pass
-
-# An error from this library
-class RedisError(Exception):
-    pass
 
 
 connect_errors = (ConnectionError, socket.error, socket.timeout)
@@ -129,20 +120,6 @@ def chunk_encoded_commands(cmds, chunk_size):
         yield b''.join(data)
 
 
-def hiredis_parser():
-    reader = hiredis.Reader()
-    while True:
-        try:
-            res = reader.gets()
-        except hiredis.ProtocolError as e:
-            raise RedisError(*e.args)
-        if isinstance(res, hiredis.ReplyError):
-            res = RedisReplyError(*res.args)
-        data = yield res
-        if data:
-            reader.feed(data)
-
-
 # Cluster hash calculation
 def calc_hash(key):
     s = key.find(b'{')
@@ -218,7 +195,7 @@ async def async_with_timeout(fut, timeout=None):
 
 
 class Connection:
-    __slots__ = 'reader', 'writer', 'buffersize', 'timeout', 'name', 'commands', 'closed', 'chunk_send_size', 'parser', 'lastdatabase', '_pubsub_cb', '_release_cb', 'thread', 'cleanedup'
+    __slots__ = 'protocol', 'buffersize', 'timeout', 'name', 'commands', 'closed', 'chunk_send_size', 'lastdatabase', '_pubsub_cb', '_release_cb', 'thread', 'cleanedup'
 
     @classmethod
     async def create(cls, endpoint, config={}):
@@ -239,11 +216,12 @@ class Connection:
         while connectretry:
             try:
                 if isinstance(endpoint, str):
-                    self.reader, self.writer = await async_with_timeout(open_unix_connection(path=endpoint, limit=buffersize), connecttimeout)
+                    # TODO buffer size
+                    self.protocol = await async_with_timeout(RedisProtocol.create_unix_connection(path=endpoint), connecttimeout)
                     self.buffersize = buffersize
                     self.timeout = sockettimeout
                 elif isinstance(endpoint, tuple):
-                    self.reader, self.writer = await async_with_timeout(open_connection(host=endpoint[0], port=endpoint[1], limit=buffersize), connecttimeout)
+                    self.protocol = await async_with_timeout(RedisProtocol.create_connection(host=endpoint[0], port=endpoint[1]), connecttimeout)
                     self.buffersize = buffersize
                     # TODO (async) setup send / recv timeout
                     self.timeout = sockettimeout
@@ -255,8 +233,8 @@ class Connection:
                 if not connectretry:
                     raise RedisError('Connection failed') from e
         # needed for cluster support
-        self.name = self.writer.get_extra_info('peername')
-        sock = self.writer.get_extra_info('socket')
+        self.name = self.protocol.get_transport().get_extra_info('peername')
+        sock = self.protocol.get_transport().get_extra_info('socket')
         if sock.family == socket.AF_INET6:
             self.name = self.name[:2]
         # TCP connection settings
@@ -279,8 +257,6 @@ class Connection:
         self.commands = deque()
         self.closed = False
         self.chunk_send_size = 16384
-        self.parser = hiredis_parser()
-        self.parser.send(None)
         self.lastdatabase = 0
         self._pubsub_cb = None
         self._release_cb = None
@@ -343,9 +319,10 @@ class Connection:
         # We call this before write_eof so no other piece of code will write to this connection
         self.closed = True
         try:
-            self.writer.write_eof()
+            self.protocol.close()
+            #self.writer.write_eof()
             # TODO (async) is there a better way to flush the buffers ?
-            await self.writer.drain()
+            #await self.writer.drain()
         except Exception:
             pass
 
@@ -355,8 +332,8 @@ class Connection:
         if not self.cleanedup:
             self.cleanedup = True
             try:
-                self.writer.close()
-                await self.writer.wait_closed()
+                self.protocol.close()
+                await self.protocol.wait_closed()
             except Exception:
                 pass
             #try:
@@ -368,8 +345,9 @@ class Connection:
                 #await self.thread
             #except Exception:
                 #raise
-            self.writer = None
-            self.reader = None
+            self.protocol = None
+            #self.writer = None
+            #self.reader = None
             self.thread = None
             if self.commands:
                 for command in self.commands:
@@ -399,22 +377,25 @@ class Connection:
                 select_cmd = Command((b'SELECT', db_number))
                 # We must append before writing because of the recv side loop
                 self.commands.append(select_cmd)
-                for x in select_cmd.stream(self.chunk_send_size):
-                    self.writer.write(x)
+                self.protocol.write(select_cmd.stream(self.chunk_send_size))
+                #for x in select_cmd.stream(self.chunk_send_size):
+                    #self.writer.write(x)
                 # TODO this can fail because in cluster mode, do we care ?
                 self.lastdatabase = db_number
             if cmd._asking:
                 # TODO must a command only be a tuple in Command ?
                 asking_cmd = Command((b'ASKING', ))
                 self.commands.append(asking_cmd)
-                for x in asking_cmd.stream(self.chunk_send_size):
-                    self.writer.write(x)
+                self.protocol.write(asking_cmd.stream(self.chunk_send_size))
+                #for x in asking_cmd.stream(self.chunk_send_size):
+                    #self.writer.write(x)
                 cmd._asking = False
             # pub/sub commands do not expect a result
             if cmd.should_enqueue():
                 self.commands.append(cmd)
-            for x in cmd.stream(self.chunk_send_size):
-                self.writer.write(x)
+            self.protocol.write(cmd.stream(self.chunk_send_size))
+            #for x in cmd.stream(self.chunk_send_size):
+                #self.writer.write(x)
             # TODO (async) should we call drain here ?
             #await self.writer.drain()
         except Exception as e:
@@ -425,14 +406,8 @@ class Connection:
 
     async def recv(self):
         try:
-            res = self.parser.send(None)
-            while res is False:
-                buffer = await self.reader.read(self.buffersize)
-                if not buffer:
-                    raise RedisError('Connection closed')
-                res = self.parser.send(buffer)
-            return res
-        except Exception:
+            return await self.protocol.read()
+        except:
             await self.aclose()
             raise
 
